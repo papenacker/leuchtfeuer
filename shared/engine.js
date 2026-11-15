@@ -1,0 +1,1921 @@
+// Spiellogik „Leuchtfeuer“ nach Regeln v0.5 mit den Entscheidungen vom 12.11.2026 (Stand 8.11.2026 über
+// data.VARIANTS_V05_8_11, v0.4 über data.VARIANTS_V04). Läuft auf dem Server (maßgeblich), in den Bots und in der Simulation;
+// die Oberfläche nutzt die Hilfsfunktionen (legale Kanten usw.) für die Anzeige.
+//
+// Aufbau: Der Zustand ist ein reines JSON-Objekt. Ablaufschritte stehen in state.queue; braucht ein Schritt eine
+// Entscheidung, setzt er state.pending = {type, seat, ...} und wartet. act(state, seat, action) löst sie auf.
+// Zwischenentscheidungen (Schatz, Karten abwerfen, Handelsangebot) unterbrechen die laufende über state.stack.
+
+import { makeBoard, distances, withNeighbors, GATES, GATE_NAMES, TOWER_GATE, CAPITAL_KEY, HOME } from "./board.js";
+import * as D from "./data.js";
+
+export const ENGINE_VERSION = 1;
+
+// ------------------------------------------------------------------ Zufall (reproduzierbar)
+function rnd(s) {
+  let t = (s.rng = (s.rng + 0x6d2b79f5) | 0);
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+function rint(s, n) {
+  return Math.floor(rnd(s) * n);
+}
+function shuffle(s, a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = rint(s, i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// ------------------------------------------------------------------ Brett (aus der Spielerzahl, zwischengespeichert)
+const BOARDS = {};
+export function board(s) {
+  const n = s.nSeats;
+  if (!BOARDS[n]) {
+    const b = makeBoard(n);
+    b.dist = distances(b);
+    BOARDS[n] = b;
+  }
+  return BOARDS[n];
+}
+
+// Nur für die Modellnamen der Kacheln („Feld 1“ wie in public/models/models.json und den GLB-Dateien), nie für Texte:
+// Die Geländeart heißt in Verlauf und Oberfläche „Acker“ (D.TERRAIN_NAME), „Feld“ meint ein Kartensechseck.
+const TILE_LABEL = { wald: "Wald", feld: "Feld", weide: "Weide", huegel: "Hügel", gebirge: "Gebirge", wasser: "Wasser", ruine: "Ruine" };
+
+// ------------------------------------------------------------------ Anlegen
+/** settings: {seed, seats: [{name, color, people?, bot?, hero?, persons?: [name, name]}], variants, personal, team,
+ *  startSeat?, heroMode: "ziehen"|"fest", ohneVoelker?, erstePartie?}
+ *  people "keins" (D.PEOPLE_NONE) = ohne Volk; ohneVoelker: alle ohne Volk. erstePartie: Turm startet mit
+ *  variants.firstMinus (1) Segment weniger (REGELN.md, „Erste Partie“). Teamspiel nur mit 2 bis 4 Farben. */
+export function createGame(settings) {
+  const v = { ...D.DEFAULT_VARIANTS, ...(settings.variants || {}) };
+  const seed = settings.seed ?? Math.floor(Math.random() * 2 ** 31);
+  const n = settings.seats.length;
+  if (n < 2 || n > 5) throw new Error("2 bis 5 Plätze");
+  if (settings.team && n > 4) throw new Error("Teamspiel nur mit 2 bis 4 Farben");
+  const ersteMinus = settings.erstePartie ? v.firstMinus ?? 1 : 0;
+  const s = {
+    engine: ENGINE_VERSION,
+    seed,
+    rng: seed | 0,
+    variants: v,
+    personal: !!settings.personal,
+    team: !!settings.team,
+    erstePartie: !!settings.erstePartie,
+    nSeats: n,
+    seats: [],
+    tiles: {},
+    bag: [],
+    buildings: {},
+    beacons: {},
+    hordes: [],
+    nextHorde: 1,
+    tower: (n <= 3 && v.startSegmentsSmall != null ? v.startSegmentsSmall : v.startSegments)
+      + (settings.team ? v.teamSegment || 0 : 0)            // v0.4: im Teamspiel 1 Segment mehr
+      - ersteMinus,                                         // erste Partie: 1 Segment weniger
+    eye: 0,
+    ruf: false,
+    journey: v.journeyStart,
+    journeyMoved: false,
+    deck: [],
+    supply: Object.fromEntries(D.RES.map((r) => [r, v.supply])),
+    round: 0,
+    start: 0,
+    dice: [],
+    rolled: [],
+    taken: {},
+    queue: [],
+    pending: null,
+    stack: [],
+    log: [],
+    stats: { rounds: [], spawned: 0, overfallsWon: 0, overfallsLost: 0, siegesWon: 0, siegesLost: 0, ausfaelle: 0,
+             eyes: 0, cancelledEyes: 0, ruf: null, heroUse: {}, fateUse: {} },
+    over: null,
+    endAfterRound: false,
+    rev: 0,
+    erklaeren: settings.erklaeren !== false,        // Erklärungen im Verlauf (ändern nichts am Ablauf)
+  };
+  // Völker: vorgegeben oder zufällig verschieden; jedes Volk nur einmal (Tisch-Durchlauf 7.11.2026). „keins“ (ohne Volk)
+  // darf mehrfach vorkommen; ohneVoelker (erste Partie): alle ohne Volk
+  const gewaehlt = settings.seats.map((x) => x.people).filter((p) => p && p !== D.PEOPLE_NONE);
+  if (new Set(gewaehlt).size !== gewaehlt.length) throw new Error("Jedes Volk gibt es nur einmal");
+  if (gewaehlt.some((p) => !D.PEOPLE_ORDER.includes(p))) throw new Error("Unbekanntes Volk");
+  const free = shuffle(s, D.PEOPLE_ORDER.filter((p) => !settings.seats.some((x) => x.people === p)));
+  settings.seats.forEach((x, i) => {
+    s.seats.push({
+      name: x.name || D.COLORS[x.color]?.name || `Spieler ${i + 1}`,
+      color: x.color || D.COLOR_ORDER[i],
+      people: settings.ohneVoelker ? D.PEOPLE_NONE : x.people || free.pop() || D.PEOPLE_ORDER[i % 5],
+      bot: !!x.bot,
+      persons: x.persons || null,
+      heroes: [],
+      heroOffer: null,
+      wantHero: x.hero || null,
+      res: Object.fromEntries(D.RES.map((r) => [r, 0])),
+      fame: 0,
+      fameBy: {},
+      hand: [],
+    });
+  });
+  s.start = settings.startSeat ?? 0;
+  // Kacheln: Hauptstadt und Schattenland fest
+  s.tiles[CAPITAL_KEY] = { kind: "hauptstadt", model: "Hauptstadt 1" };
+  s.tiles["6,1"] = { kind: "tor", model: "Schattenland-Tor 1" };
+  s.tiles["6,2"] = { kind: "turm_tor", model: "Turm-Tor 1" };
+  s.tiles["6,3"] = { kind: "feuerberg", model: "Feuerberg 1" };
+  const counts = n >= 4 ? D.TILES_BIG : D.TILES_SMALL;
+  for (const [kind, k] of Object.entries(counts)) {
+    for (let i = 0; i < k; i++) {
+      s.bag.push({ kind, model: `${TILE_LABEL[kind]} ${i + 1}`, treasure: !v.noTreasure && i === 0 && D.TREASURE_KINDS.includes(kind) });
+    }
+  }
+  shuffle(s, s.bag);
+  for (const id of D.FATE_IDS) s.deck.push(id, id);
+  shuffle(s, s.deck);
+  // Den Startwert sieht niemand bis zum Spielende (daraus ließen sich verdeckte Karten, Nebel und Würfe berechnen)
+  log(s, `Neues Spiel mit ${n} Plätzen.`);
+  erkl(s, null, () => ({
+    k: "aufbau", n, turm: s.tower, max: v.towerMax, team: s.team, uhr: !!v.questClock, startRuhm: !!v.startRuhm, start: s.start,
+    klein: v.startSegmentsSmall ?? null, gross: v.startSegments, teamPlus: s.team ? v.teamSegment || 0 : 0, ersteMinus,
+    ohneVoelker: s.seats.every((x) => x.people === D.PEOPLE_NONE), sieg: !!v.heldDesWestens, entfaellt: !!v.missingNoTower,
+    helden: settings.seats.every((x) => x.hero) ? "fest" : s.team ? "team" : n >= 5 ? "eins" : "zwei",
+  }));
+  s.queue.push({ t: "heroes" }, { t: "water" }, { t: "homeTiles" }, { t: "startPlacement" }, { t: "roundStart" });
+  run(s);
+  for (const l of s.log) if (l.v !== undefined) l.v = 0;     // Aufbau zählt nicht als „letzter Schritt“
+  return s;
+}
+
+// ------------------------------------------------------------------ Hilfen
+// Verlauf: {r, seat, msg} (deutscher Satz). Mit Erklärungen zusätzlich v = Nummer der Aktion (s.rev nach act()),
+// damit die Oberfläche alles findet, was der letzte Schritt ausgelöst hat.
+function log(s, msg, seat = null) {
+  const l = { r: s.round, seat, msg };
+  if (s.erklaeren !== false) l.v = s.rev + 1;
+  s.log.push(l);
+  if (s.log.length > 4000) s.log.splice(0, s.log.length - 4000);
+}
+
+// ------------------------------------------------------------------ Erklärungen (Erklärmodus der Oberfläche)
+// Zu jedem Spielschritt legt die Engine eine strukturierte Erklärung in den Verlauf: {r, seat, v, erkl: {k, …}}
+// (k = Art, dazu die echten Zahlen). Text daraus macht shared/i18n_erklaer.js auf Deutsch oder Englisch.
+// Erklärungen ändern den Spielablauf nie: Sie lesen nur den Zustand, ziehen keinen Zufall, und ein Fehler beim
+// Zusammenstellen wird verschluckt. s.erklaeren === false (createGame({erklaeren: false})) schaltet sie ab.
+// Verdeckte Angaben (Schicksalskarten auf der Hand) kommen nie hinein: Den Verlauf sehen alle. Helden liegen offen (REGELN.md, Aufbau 7).
+function erklVor(s, bau) {
+  if (s.erklaeren === false) return null;
+  try {
+    return bau() || null;
+  } catch {
+    return null;
+  }
+}
+function erkl(s, seat, bau) {
+  const e = typeof bau === "function" ? erklVor(s, bau) : s.erklaeren === false ? null : bau;
+  if (!e) return;
+  s.log.push({ r: s.round, seat, v: s.rev + 1, erkl: e });
+  if (s.log.length > 4000) s.log.splice(0, s.log.length - 4000);
+}
+// Gelände der Felder einer Kante oder Ecke (null = Nebel ohne Kachel), so wie sie gerade liegen
+function kindOf(s, f) {
+  return s.tiles[f]?.kind || null;
+}
+function edgeKinds(s, edge) {
+  return board(s).edges[edge].fields.map((f) => kindOf(s, f));
+}
+function cornerKinds(s, corner) {
+  return board(s).corners[corner].fields.map((f) => kindOf(s, f));
+}
+function litCount(s) {
+  return Object.values(s.beacons).filter((b) => b.lit).length;
+}
+// Himmelsrichtung von einem Feld zum Nachbarn in 45°-Schritten: 0 Osten, 2 Norden, 4 Westen, 6 Süden (wie dirName in game.js)
+function richtung(s, von, nach) {
+  const b = board(s);
+  const a = (Math.atan2(b.pos[nach].y - b.pos[von].y, b.pos[nach].x - b.pos[von].x) * 180) / Math.PI;
+  return ((Math.round(a / 45) % 8) + 8) % 8;
+}
+function rufNeed(s) {
+  return s.nSeats <= 3 && s.variants.rufCountSmall !== undefined ? s.variants.rufCountSmall : s.variants.rufCount;
+}
+/** Reichweite des Chronisten in Feldern (Weg der Horden; das Nachbarfeld der Hauptstadt ist 1 Feld) */
+export function chronistReichweite(s) {
+  return s.variants.chronistDist ?? 1;
+}
+/** Horden, die der Chronist nehmen darf (höchstens chronistReichweite Felder vor der Hauptstadt, die Hauptstadt selbst eingeschlossen) */
+export function chronistZiele(s) {
+  const b = board(s);
+  const d = chronistReichweite(s);
+  return s.hordes.filter((h) => b.dist[h.pos] <= d);
+}
+/** Horden, die Hüterin und Bannspruch zurückschicken dürfen (seit 12.11.2026 nicht vom Turm-Tor) */
+export function bannZiele(s) {
+  return s.variants.bannAussen ? s.hordes.filter((h) => h.pos !== TOWER_GATE) : s.hordes.slice();
+}
+export function seatName(s, i) {
+  return s.seats[i]?.name ?? "?";
+}
+function order(s, from = s.start) {
+  return Array.from({ length: s.nSeats }, (_, k) => (from + k) % s.nSeats);
+}
+function addFame(s, seat, n, why) {
+  s.seats[seat].fame += n;
+  s.seats[seat].fameBy[why] = (s.seats[seat].fameBy[why] || 0) + n;
+}
+function gain(s, seat, res, n) {
+  const k = Math.max(0, Math.min(n, s.supply[res]));
+  s.supply[res] -= k;
+  s.seats[seat].res[res] += k;
+  return k;
+}
+function payRes(s, seat, cost) {
+  for (const [r, k] of Object.entries(cost)) {
+    s.seats[seat].res[r] -= k;
+    s.supply[r] += k;
+  }
+}
+export function canAfford(s, seat, cost) {
+  return Object.entries(cost).every(([r, k]) => s.seats[seat].res[r] >= k);
+}
+export function costFor(s, seat, what) {
+  const c = { ...D.COSTS[what] };
+  if (s.seats[seat].people === "zwerge" && (s.variants.zwergeOn || ["burg", "festung", "leuchtfeuer"]).includes(what) && c.stein) {
+    c.stein -= 1;
+    if (!c.stein) delete c.stein;
+  }
+  return c;
+}
+export function costList(list) {
+  const c = {};
+  for (const r of list) c[r] = (c[r] || 0) + 1;
+  return c;
+}
+function hasHero(s, seat, id) {
+  return s.seats[seat].heroes.some((h) => h.id === id && !h.used);
+}
+function useHero(s, seat, id) {
+  const h = s.seats[seat].heroes.find((x) => x.id === id && !x.used);
+  h.used = true;
+  s.stats.heroUse[id] = (s.stats.heroUse[id] || 0) + 1;
+}
+function takeCard(s, seat, id) {
+  const i = s.seats[seat].hand.indexOf(id);
+  if (i < 0) return false;
+  s.seats[seat].hand.splice(i, 1);
+  s.deck.push(id);                 // unter den Stapel
+  s.stats.fateUse[id] = (s.stats.fateUse[id] || 0) + 1;
+  return true;
+}
+function drawFate(s, seat, n = 1) {
+  const got = [];
+  for (let k = 0; k < n && s.deck.length; k++) got.push(s.deck.shift());
+  return got;
+}
+function giveFate(s, seat) {
+  const [c] = drawFate(s, seat, 1);
+  if (!c) return;
+  s.seats[seat].hand.push(c);
+  checkHand(s, seat);
+}
+function checkHand(s, seat) {
+  const over = s.seats[seat].hand.length - s.variants.handLimit;
+  if (over > 0) interrupt(s, { type: "discard", seat, n: over });
+}
+function interrupt(s, p) {
+  if (s.pending) s.stack.push(s.pending);
+  s.pending = p;
+}
+function resume(s) {
+  s.pending = s.stack.pop() || null;
+  if (!s.pending) run(s);
+}
+function finishPending(s, st) {
+  // eine Entscheidung eines Ablaufschritts ist gefallen: Schritt fortsetzen
+  s.pending = null;
+  if (st) s.queue.unshift(st);
+  if (s.stack.length) {
+    s.pending = s.stack.pop();
+    return;
+  }
+  run(s);
+}
+
+// ------------------------------------------------------------------ Brett-Abfragen
+export function buildingsAt(s, field) {
+  const b = board(s);
+  return b.pos[field].edges.filter((e) => s.buildings[e]).map((e) => ({ edge: e, ...s.buildings[e] }));
+}
+export function seatFields(s, seat) {
+  const b = board(s);
+  const out = new Set();
+  for (const [e, bl] of Object.entries(s.buildings)) {
+    if (bl.seat !== seat) continue;
+    for (const f of b.edges[e].fields) if (s.tiles[f]) out.add(f);
+  }
+  return out;
+}
+function isShadow(s, f) {
+  return board(s).pos[f].type === "shadow";
+}
+function emptyFog(s, f) {
+  return board(s).pos[f].type === "fog" && !s.tiles[f];
+}
+export function pieceUse(s, seat) {
+  const u = { gehoeft: 0, burg: 0, festung: 0 };
+  for (const bl of Object.values(s.buildings)) {
+    if (bl.seat !== seat) continue;
+    u.gehoeft++;
+    if (bl.level >= 2) u.burg++;
+    if (bl.level >= 3) u.festung++;
+  }
+  return u;
+}
+export function legalGehoeftEdges(s, seat, start = false) {
+  const b = board(s);
+  const out = [];
+  if (start) {
+    for (const e of Object.values(b.edges)) {
+      if (s.buildings[e.key]) continue;
+      if (e.fields.length < 2 && !s.variants.randplaetze) continue;      // nur zwischen zwei Kacheln
+      if (e.fields.every((f) => ["home", "capital"].includes(b.pos[f].type))) out.push(e.key);
+    }
+    return out;
+  }
+  const mine = seatFields(s, seat);
+  if (!mine.size) {                 // alle Gebäude verloren: neu im Heimatland
+    return legalGehoeftEdges(s, seat, true);
+  }
+  const seen = new Set();
+  for (const f of mine) {
+    if (isShadow(s, f)) continue;
+    for (const e of b.pos[f].edges) {
+      if (seen.has(e) || s.buildings[e]) continue;
+      seen.add(e);
+      if (b.edges[e].fields.some((g) => isShadow(s, g))) continue;
+      if (b.edges[e].fields.length < 2 && !s.variants.randplaetze) continue;   // am Kartenrand fiele es herunter
+      out.push(e);
+    }
+  }
+  return out;
+}
+export function legalUpgrades(s, seat) {
+  const use = pieceUse(s, seat);
+  return Object.entries(s.buildings)
+    .filter(([, bl]) => bl.seat === seat && bl.level < 3 && (bl.level === 1 ? use.burg < D.PIECES.burg : use.festung < D.PIECES.festung))
+    .map(([e, bl]) => ({ edge: e, to: bl.level + 1 }));
+}
+function beaconAtField(s, f) {
+  return board(s).pos[f].corners.some((c) => s.beacons[c]);
+}
+export function legalBeaconCorners(s, seat) {
+  const b = board(s);
+  if (Object.keys(s.beacons).length >= s.variants.beacons) return [];
+  const mine = seatFields(s, seat);
+  const out = new Set();
+  for (const f of mine) {
+    const kind = s.tiles[f]?.kind;
+    if (kind !== "gebirge" && kind !== "huegel") continue;
+    for (const c of b.pos[f].corners) {
+      if (s.beacons[c]) continue;
+      const fs = b.corners[c].fields;
+      if (fs.some((g) => isShadow(s, g))) continue;
+      if (!s.variants.randplaetze && (fs.length < 3 || fs.some((g) => !s.tiles[g]))) continue;   // nur Ecken mit 3 Kacheln
+      const hills = fs.filter((g) => ["gebirge", "huegel"].includes(s.tiles[g]?.kind));
+      if (hills.some((g) => beaconAtField(s, g))) continue;
+      out.add(c);
+    }
+  }
+  return [...out];
+}
+export function litBeaconNear(s, field) {
+  const near = new Set(withNeighbors(board(s), field));
+  const b = board(s);
+  return Object.entries(s.beacons).some(([c, bc]) => bc.lit && b.corners[c].fields.some((f) => near.has(f)));
+}
+export function hordesAt(s, field) {
+  return s.hordes.filter((h) => h.pos === field);
+}
+export function hordeStrength(s) {
+  return s.tower >= s.variants.strongFrom ? s.variants.hordeStrengthHigh : s.variants.hordeStrength;
+}
+export function baseDefense(s, field, onlySeat = null) {
+  let d = 0;
+  for (const bl of buildingsAt(s, field)) {
+    if (onlySeat !== null && bl.seat !== onlySeat) continue;
+    if (bl.level === 2) d += 1;
+    if (bl.level === 3) d += 2;
+  }
+  return d;
+}
+export function payers(s, field) {
+  const owners = new Set(buildingsAt(s, field).map((x) => x.seat));
+  // an der Hauptstadt dürfen seit 12.11.2026 immer alle zahlen (siegeAllPay), sonst die Besitzer, mit Leuchtfeuer alle
+  const all = (field === CAPITAL_KEY && !!s.variants.siegeAllPay) || litBeaconNear(s, field);
+  return order(s).filter((i) => all || owners.has(i));
+}
+export function horseValue(s, seat) {
+  return s.seats[seat].people === "menschen" ? 2 : 1;
+}
+export function bankRate(s, seat) {
+  const b = board(s);
+  let rate = s.variants.bankRate;
+  for (const [e, bl] of Object.entries(s.buildings)) {
+    if (bl.seat !== seat) continue;
+    const fs = b.edges[e].fields;
+    if (fs.includes(CAPITAL_KEY)) rate = Math.min(rate, s.variants.capitalRate);
+    if (!s.variants.noHafen && s.seats[seat].people === "kuestenvolk" && fs.some((f) => s.tiles[f]?.kind === "wasser")) rate = Math.min(rate, 2);
+  }
+  if (s.variants.kuesteImmer && s.seats[seat].people === "kuestenvolk") rate = Math.min(rate, 2);   // Prüfvariante: Hafen ohne Bedingung
+  return rate;
+}
+export function journeyStep(s) {
+  const j = D.JOURNEYS[s.variants.journey] || D.JOURNEYS.v03;
+  if (s.journey >= 10) return null;
+  const [cost, fame, danger] = j[s.journey];
+  return { field: s.journey + 1, cost: costList(cost), fame, danger };
+}
+export function ausfallTargets(s, seat) {
+  const out = [];
+  if (s.variants.noAusfall) return out;                // v0.5: kein Ausfall
+  const fields = new Set(s.hordes.map((h) => h.pos));
+  for (const f of fields) {
+    if (!buildingsAt(s, f).some((x) => x.seat === seat)) continue;
+    const need = hordeStrength(s) * hordesAt(s, f).length - baseDefense(s, f, seat);
+    out.push({ field: f, need: Math.max(0, need) });
+  }
+  return out;
+}
+/** Ertrag eines Würfels für einen Platz. teile (optional, für die Erklärung): Liste, in die jedes Gebäude mit Ertrag
+ *  kommt: {lvl, fs: Gelände der Kante, basis: Stufe je passendes Feld, haupt: Zuschlag Hauptstadt, kueste: Küstenvolk} */
+export function harvestYield(s, seat, face, own, teile = null) {
+  const res = D.TERRAIN_RES[face];
+  if (!res) return { res: null, n: 0 };
+  const b = board(s);
+  const kv = s.seats[seat].people === "kuestenvolk";
+  const fischer = own && kv && s.variants.kuesteFischer;      // Küstenvolk: Wasser zählt wie das gewürfelte Gelände
+  // Prüfvariante: nur das eigene Wasser (beim Aufbau gelegt) zählt für die Fähigkeiten
+  const kWasser = (f) => s.tiles[f]?.kind === "wasser" && (!s.variants.kuesteNurEigenes || s.tiles[f].kueste);
+  let n = 0;
+  for (const [e, bl] of Object.entries(s.buildings)) {
+    if (bl.seat !== seat) continue;
+    let y = 0, yw = 0;
+    for (const f of b.edges[e].fields) {
+      const kind = s.tiles[f]?.kind;
+      if (kind === face) y += bl.level;
+      else if (fischer && kWasser(f)) { y += bl.level; yw += bl.level; }
+    }
+    const y0 = y;
+    if (y > 0 && s.variants.capitalDouble && b.edges[e].fields.includes(CAPITAL_KEY)) y += bl.level;
+    if (y > 0 && own && s.variants.capitalPlus && b.edges[e].fields.includes(CAPITAL_KEY)) y += 1;    // Hauptstadt: eigene Ernte +1   // Hauptstadt zählt wie das Nachbarfeld
+    const y1 = y;
+    const amWasser = kv && b.edges[e].fields.some(kWasser);
+    if (y > 0 && !s.variants.noKuesteErnte && (own || s.variants.kuesteShared) && amWasser) y += 1;          // v0.4 (Seefahrer)
+    if (own && amWasser && s.variants.kuesteWasserPlus) y += s.variants.kuesteWasserPlus;                  // Prüfvariante c
+    if (teile && y > 0) teile.push({ lvl: bl.level, fs: edgeKinds(s, e), basis: y0, wasser: yw, haupt: y1 - y0, kueste: y - y1 });
+    n += y;
+  }
+  // Prüfvarianten Küstenvolk: mit Gebäude am Wasser bringt der eigene Würfel 1 mehr (d: nur wenn er etwas bringt, d2: immer)
+  if (own && kv && (s.variants.kuesteWasserEins || s.variants.kuesteWasserImmer) && Object.entries(s.buildings)
+    .some(([e, bl]) => bl.seat === seat && b.edges[e].fields.some(kWasser))) {
+    if (s.variants.kuesteWasserImmer) n += s.variants.kuesteWasserImmer;
+    else if (n > 0) n += s.variants.kuesteWasserEins;
+  }
+  // v0.5: Bringt der eigene Würfel etwas, gibt es 1 Rohstoff mehr (nicht bei der gemeinsamen Ernte)
+  if (own && n > 0 && s.variants.ownPlus) n += s.variants.ownPlus;
+  return { res, n };
+}
+/** Ist im Vorrat überhaupt noch ein Rohstoff? */
+function vorratDa(s) {
+  return D.RES.some((r) => s.supply[r] > 0);
+}
+/** quelle (nur für die Erklärung): "wuerfel", "planerin", "karte"; null = gemeinsame Ernte (erklärt roundEnd).
+ *  trost: Bringt der Würfel nichts, gibt es 1 beliebigen Rohstoff (leerTrost; nur eigener Würfel und Planerin, nicht die
+ *  Reiche Ernte); dann steht trost: true in der Erklärung. */
+function harvest(s, seat, face, own, quelle = null, trost = false) {
+  const teile = quelle && s.erklaeren !== false ? [] : null;
+  const { res, n } = harvestYield(s, seat, face, own, teile);
+  const geb = () => Object.values(s.buildings).filter((bl) => bl.seat === seat).length;
+  if (!res || !n) {
+    if (quelle) erkl(s, seat, () => ({ k: "ernte", quelle, face, res, soll: 0, ist: 0, teile: [], geb: geb(),
+      fischer: own && s.seats[seat].people === "kuestenvolk" && !!s.variants.kuesteFischer, trost: trost && vorratDa(s) }));
+    return 0;
+  }
+  const k = gain(s, seat, res, n);
+  if (k) log(s, `${seatName(s, seat)} erntet ${k} ${D.RES_NAME[res]}${k < n ? " (Vorrat reicht nicht)" : ""}.`, seat);
+  if (quelle) erkl(s, seat, () => ({ k: "ernte", quelle, face, res, soll: n, ist: k, teile, geb: geb(), plus: own ? s.variants.ownPlus || 0 : 0,
+    fischer: own && s.seats[seat].people === "kuestenvolk" && !!s.variants.kuesteFischer, trost: trost && !k && vorratDa(s) }));
+  return k;
+}
+/** Eigener Würfel (auch mit der Planerin) ernten; bringt er nichts und gilt leerTrost, darf der Platz im selben Zug
+ *  1 beliebigen Rohstoff nehmen (p.trost zählt, wie viele noch offen sind). */
+function harvestOwn(s, seat, face, p, quelle) {
+  const trost = !!s.variants.leerTrost;
+  const k = harvest(s, seat, face, true, quelle, trost);
+  if (!k && trost && vorratDa(s)) p.trost = (p.trost || 0) + 1;
+  return k;
+}
+export const START_GEHOEFTE = 2;   // je Platz; seit v0.5 (startRuhm) bringen sie Ruhm wie jedes Gehöft (REGELN.md, Aufbau 9), bis v0.4 keinen
+/** Ruhm eines Platzes.
+ *  leiste: Stand der Ruhm-Leiste wie am Tisch (v0.4): Gebäude-Ruhm kommt sofort dazu (Gehöft 1, jeder Ausbau 1 mehr),
+ *          die Startgehöfte bringen keinen, jede verlorene Stufe kostet 1, aber nie unter 0 (was die 0 abfängt,
+ *          zählt seat.leisteAusgleich). Danach gehen Sieg und Startspieler.
+ *  fame: Ruhm ohne Gebäude (Reise, Kämpfe, Leuchtfeuer, Helden, Ruine), bauRuhm: Anteil der Gebäude an der Leiste,
+ *  bau: alle Gebäudestufen, total = fame + bau (alte Zählung mit den Startgehöften, nur noch für die Bots). */
+export function score(s, seat) {
+  const x = s.seats[seat];
+  let bau = 0;
+  for (const bl of Object.values(s.buildings)) if (bl.seat === seat) bau += bl.level;
+  // v0.5 (startRuhm): Startgehöfte bringen Ruhm wie jedes Gehöft, die Leiste kann dann nicht unter 0 fallen
+  const leiste = Math.max(0, x.fame + bau - (s.variants.startRuhm ? 0 : START_GEHOEFTE) + (x.leisteAusgleich || 0));
+  return { fame: x.fame, bau, bauRuhm: leiste - x.fame, leiste, total: x.fame + bau, res: D.RES.reduce((a, r) => a + x.res[r], 0) };
+}
+
+// ------------------------------------------------------------------ Turm, Horden, Leuchtfeuer
+function towerGrow(s, n, why) {
+  if (n <= 0) return;
+  s.tower += n;
+  s.stats.grow = s.stats.grow || {};
+  s.stats.grow[why] = (s.stats.grow[why] || 0) + n;
+  s.stats.lastGrow = why;
+  log(s, `Der Turm wächst um ${n} auf ${s.tower} (${why}).`);
+  erkl(s, null, () => ({
+    k: "turm", n, t: s.tower, max: s.variants.towerMax, grund: why, je: hordeStrength(s),
+    stark: s.tower >= s.variants.strongFrom && s.tower - n < s.variants.strongFrom,
+  }));
+  if (s.tower >= s.variants.towerMax) endGame(s, true, "Der Turm des Schattens ist vollendet.");
+}
+/** Hordenteile auf dem Brett (v0.5): Ein Stapel ist 1 Figur, jede weitere Horde darauf 1 Ring. In der Hauptstadt
+ *  braucht es seit 12.11.2026 keine Ringe (capitalNoRings): Die Horden dort werden nur gezählt (dort steht höchstens
+ *  kurz, bis der Überfall sie in den Vorrat schickt, eine Figur). */
+export function hordePieces(s) {
+  const ohneRinge = !!s.variants.capitalNoRings;
+  const felder = new Set(s.hordes.map((h) => h.pos));
+  const figuren = felder.size;
+  const zaehlt = ohneRinge ? s.hordes.filter((h) => h.pos !== CAPITAL_KEY).length : s.hordes.length;
+  const felderZaehlt = ohneRinge ? figuren - (felder.has(CAPITAL_KEY) ? 1 : 0) : figuren;
+  return { figuren, ringe: zaehlt - felderZaehlt };
+}
+/** Fehlt nach dem Versetzen der Horde h auf das Feld ziel eine Figur oder ein Ring? (h kommt aus einem Stapel oder steht allein) */
+function teilFehltNach(s, h, ziel) {
+  const alt = h.pos;
+  h.pos = ziel;
+  const t = hordePieces(s);
+  h.pos = alt;
+  return t.figuren > s.variants.hordes || (!!s.variants.rings && t.ringe > s.variants.rings);
+}
+/** info (nur für die Erklärung): {i, n} = Auge i von n eines Runenwurfs, sonst {anlass} */
+function spawnHorde(s, info = null) {
+  const von = GATES[s.eye];
+  s.eye = (s.eye + 1) % GATES.length;
+  const gate = GATES[s.eye];
+  if (s.variants.rings) {
+    // v0.5: Auf ein freies Tor kommt eine Figur, auf ein besetztes ein Ring. Fehlt das Teil: Turm +1.
+    const besetzt = s.hordes.some((h) => h.pos === gate);
+    const t = hordePieces(s);
+    if (besetzt ? t.ringe >= s.variants.rings : t.figuren >= s.variants.hordes) {
+      // seit 12.11.2026 (missingNoTower): Die Horde entfällt ohne weitere Folge; vorher wuchs dafür der Turm
+      const entfaellt = !!s.variants.missingNoTower;
+      log(s, `Das Auge blickt zum ${GATE_NAMES[gate]}, aber ${besetzt ? "kein Ring" : "keine Horde"} ist mehr im Vorrat${entfaellt ? ": Die Horde entfällt" : ""}.`);
+      erkl(s, null, () => ({ k: "auge", von, nach: gate, leer: true, teil: besetzt ? "ring" : "figur", max: besetzt ? s.variants.rings : s.variants.hordes,
+        i: info?.i ?? null, n: info?.n ?? null, entfaellt }));
+      if (!entfaellt) towerGrow(s, 1, besetzt ? "kein Ring mehr im Vorrat" : "keine Horde mehr im Vorrat");
+      return;
+    }
+    s.hordes.push({ id: s.nextHorde++, pos: gate });
+    s.stats.spawned++;
+    log(s, besetzt ? `Das Auge blickt zum ${GATE_NAMES[gate]}: Dort erscheint eine weitere Ork-Horde (ein Ring mehr).`
+      : `Das Auge blickt zum ${GATE_NAMES[gate]}: Dort erscheint eine Ork-Horde.`);
+    erkl(s, null, () => {
+      const nachher = hordePieces(s);
+      return { k: "auge", von, nach: gate, teil: besetzt ? "ring" : "figur", figuren: s.variants.hordes - nachher.figuren,
+        ringe: s.variants.rings - nachher.ringe, maxF: s.variants.hordes, maxR: s.variants.rings, dort: hordesAt(s, gate).length,
+        i: info?.i ?? null, n: info?.n ?? null, entfaellt: !!s.variants.missingNoTower };
+    });
+    return;
+  }
+  if (s.hordes.length >= s.variants.hordes) {
+    log(s, `Das Auge blickt zum ${GATE_NAMES[gate]}, aber keine Horde ist mehr im Vorrat.`);
+    erkl(s, null, () => ({ k: "auge", von, nach: gate, leer: true, max: s.variants.hordes, i: info?.i ?? null, n: info?.n ?? null }));
+    towerGrow(s, 1, "keine Horde mehr im Vorrat");
+    return;
+  }
+  if (s.variants.hordeStack && s.hordes.some((h) => h.pos === gate)) {   // Prüfvariante: höchstens 1 Horde je Feld
+    s.stats.stackBlocked = (s.stats.stackBlocked || 0) + 1;
+    towerGrow(s, 1, "Tor besetzt");
+    return;
+  }
+  s.hordes.push({ id: s.nextHorde++, pos: gate });
+  s.stats.spawned++;
+  log(s, `Das Auge blickt zum ${GATE_NAMES[gate]}: Dort erscheint eine Ork-Horde.`);
+  erkl(s, null, () => ({
+    k: "auge", von, nach: gate, vorrat: s.variants.hordes - s.hordes.length, max: s.variants.hordes,
+    dort: hordesAt(s, gate).length, i: info?.i ?? null, n: info?.n ?? null,
+  }));
+}
+function removeHordes(s, ids) {
+  s.hordes = s.hordes.filter((h) => !ids.includes(h.id));
+}
+function checkRuf(s, seat) {
+  const need = rufNeed(s);
+  if (s.ruf || !need) return;
+  const lit = Object.entries(s.beacons).filter(([, b]) => b.lit);
+  if (lit.length < need) return;
+  s.ruf = true;
+  const ruhm = s.variants.rufFame ?? 3;     // seit 12.11.2026: 1 Ruhm zusätzlich (vorher 3)
+  if (s.variants.rufSave) {             // Ruf wird aufgehoben und kommt in der dunkelsten Stunde (siehe rufFire)
+    s.rufReady = true;
+    addFame(s, seat, ruhm, "leuchtfeuer");
+    s.stats.ruf = s.round;
+    return;
+  }
+  const b = board(s);
+  const fields = new Set(lit.flatMap(([c]) => b.corners[c].fields));
+  const gone = s.variants.rufNoKill ? [] : s.hordes.filter((h) => fields.has(h.pos)).map((h) => h.id);   // v0.5: keine Horden mehr
+  removeHordes(s, gone);
+  const vor = s.tower;
+  s.tower = Math.max(0, s.tower - (s.variants.rufTower || 1));
+  if (ruhm) addFame(s, seat, ruhm, "leuchtfeuer");
+  s.stats.ruf = s.round;
+  if (s.variants.rufNoKill) log(s, `Ruf der Leuchtfeuer! Der Turm verliert ein Segment (${s.tower}). ${seatName(s, seat)} erhält ${ruhm} Ruhm.`, seat);
+  else log(s, `Ruf der Leuchtfeuer! ${gone.length} Horden vernichtet, der Turm verliert ein Segment (${s.tower}). ${seatName(s, seat)} erhält ${ruhm} Ruhm.`, seat);
+  erkl(s, seat, () => ({ k: "ruf", n: lit.length, weg: s.variants.rufNoKill ? null : gone.length, minus: vor - s.tower, turm: s.tower, ruhm,
+    zusaetzlich: s.variants.rufFame !== undefined }));
+}
+/** Jedes Gebäude am Feld verliert eine Stufe. -> Liste für die Erklärung: {seat, von, nach (0 = zerstört), geschont, null0} */
+function knockDown(s, field) {
+  const out = [];
+  for (const bl of buildingsAt(s, field)) {
+    const seat = bl.seat;
+    if (bl.level === 1 && s.seats[seat].people === "halblinge" && s.variants.halblinge !== "A") {
+      out.push({ seat, von: 1, nach: 1, geschont: true });
+      continue;
+    }
+    out.push({ seat, von: bl.level, nach: bl.level - 1, null0: score(s, seat).leiste === 0 });
+    // Die Stufe kostet 1 Ruhm, aber die Leiste geht nie unter 0
+    if (score(s, seat).leiste === 0) s.seats[seat].leisteAusgleich = (s.seats[seat].leisteAusgleich || 0) + 1;
+    if (bl.level === 1) {
+      delete s.buildings[bl.edge];
+      log(s, `Ein Gehöft von ${seatName(s, seat)} wird zerstört.`, seat);
+    } else {
+      s.buildings[bl.edge].level -= 1;
+      log(s, `${D.LEVEL_NAME[bl.level]} von ${seatName(s, seat)} wird zu ${D.LEVEL_NAME[bl.level - 1]}.`, seat);
+    }
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------ Spielende
+function endGame(s, lost, reason) {
+  if (s.over) return;
+  // Wer am meisten Ruhm auf der Leiste hat, bei Gleichstand mehr Rohstoffe; ist auch das gleich,
+  // teilen sie sich den Sieg (winners: alle Sieger, ranking[0] ist nur der erste von ihnen)
+  const ranking = order(s, 0).map((i) => ({ seat: i, ...score(s, i) }))
+    .sort((a, b) => b.leiste - a.leiste || b.res - a.res);
+  const top = ranking[0];
+  const winners = lost ? [] : ranking.filter((r) => r.leiste === top.leiste && r.res === top.res).map((r) => r.seat);
+  // heldDesWestens (12.11.2026): Wird der Turm nicht vollendet, siegen alle gemeinsam; „winners“ sind dann die Helden
+  // des Westens (meister Ruhm). Mechanik und Wertung bleiben gleich, nur der Rahmen (Texte) ist anders.
+  const held = !!s.variants.heldDesWestens;
+  s.over = { lost, reason, ranking, winners, round: s.round, tower: s.tower, journey: s.journey, heldDesWestens: held, seed: s.seed };
+  s.pending = null;
+  s.queue = [];
+  s.stack = [];
+  const namen = winners.map((w) => seatName(s, w));
+  if (lost) log(s, `${reason} Alle haben verloren.`);
+  else if (held && namen.length > 1) log(s, `${reason} Alle haben gemeinsam gesiegt. Helden des Westens sind ${namen.slice(0, -1).join(", ")} und ${namen.at(-1)} mit je ${top.leiste} Ruhm.`);
+  else if (held) log(s, `${reason} Alle haben gemeinsam gesiegt. Held des Westens ist ${namen[0]} mit ${top.leiste} Ruhm.`);
+  else if (namen.length > 1) log(s, `${reason} Es gewinnen ${namen.slice(0, -1).join(", ")} und ${namen.at(-1)} gemeinsam mit ${top.leiste} Ruhm.`);
+  else log(s, `${reason} Es gewinnt ${namen[0]} mit ${top.leiste} Ruhm.`);
+  erkl(s, null, () => ({
+    k: "ende", grund: lost ? "turm" : /^Abbruch/.test(reason) ? "abbruch" : "reise", r: s.round, turm: s.tower,
+    max: s.variants.towerMax, ranking: ranking.map((x) => [x.seat, x.leiste, x.res]), winners, held,
+  }));
+}
+
+// ------------------------------------------------------------------ Ablaufschritte
+/** Reaktion auf den Runenwurf: wer schon gefragt wurde (alte Spielstände bis 12.11.2026 kannten nur st.i) */
+function gefragtAnlegen(st) {
+  if (st.asked) return;
+  st.asked = {};
+  for (const seat of (st.order || []).slice(0, st.i || 0)) st.asked[`${seat}:zauberin`] = st.asked[`${seat}:gelehrter`] = true;
+}
+const STEPS = {
+  heroes(s, st) {
+    // feste Helden (Familienrunde) oder ziehen: je Person 1 (Team), zu fünft 1, sonst 2 ziehen, 1 behalten
+    if (st.i === undefined) {
+      const fixed = s.seats.flatMap((x) => (x.wantHero ? [].concat(x.wantHero) : []));
+      st.pool = shuffle(s, D.HERO_IDS.filter((h) => !fixed.includes(h)));
+      for (const seat of s.seats) {
+        if (seat.wantHero) {
+          const wants = Array.isArray(seat.wantHero) ? seat.wantHero : [seat.wantHero];
+          seat.heroes = wants.map((id) => ({ id, used: false }));
+        }
+      }
+      st.i = 0;
+    }
+    while (st.i < s.nSeats) {
+      const seat = s.seats[st.i];
+      if (seat.heroes.length) {
+        const ids = seat.heroes.map((h) => h.id);
+        erkl(s, st.i, { k: "heldWahl", art: "fest", ids });
+        st.i++;
+        continue;
+      }
+      if (s.team) {
+        const k = seat.persons ? seat.persons.length : 2;
+        seat.heroes = st.pool.splice(0, k).map((id) => ({ id, used: false }));
+        erkl(s, st.i, { k: "heldWahl", art: "team", ids: seat.heroes.map((h) => h.id) });
+        st.i++;
+        continue;
+      }
+      if (s.nSeats >= 5 || st.pool.length < 2) {
+        seat.heroes = st.pool.splice(0, 1).map((id) => ({ id, used: false }));
+        erkl(s, st.i, { k: "heldWahl", art: "eins", ids: seat.heroes.map((h) => h.id) });
+        st.i++;
+        continue;
+      }
+      seat.heroOffer = st.pool.splice(0, 2);
+      s.pending = { type: "chooseHero", seat: st.i, offer: seat.heroOffer, step: st };
+      return;
+    }
+  },
+  water(s, st) {
+    const k = s.seats.findIndex((x) => x.people === "kuestenvolk");
+    if (k < 0 || st.done) return;
+    s.pending = { type: "placeWater", seat: k, step: st };
+  },
+  homeTiles(s) {
+    const b = board(s);
+    const gezogen = {};          // nur für die Erklärung
+    let ruine = 0, schatz = 0;
+    for (const [c, r] of HOME) {
+      const key = `${c},${r}`;
+      if (!b.pos[key] || s.tiles[key]) continue;
+      let t = s.bag.shift();
+      let guard = 0;
+      // Ruine (v0.4 auch Schatz-Plättchen) verdeckt zurück unter die übrigen Plättchen, dann ein anderes umdrehen (REGELN.md, Aufbau 3)
+      while ((t.kind === "ruine" || t.treasure) && guard++ < 50) {
+        if (t.kind === "ruine") ruine++;
+        else schatz++;
+        s.bag.splice(1 + rint(s, s.bag.length), 0, t);
+        t = s.bag.shift();
+      }
+      s.tiles[key] = { kind: t.kind, model: t.model };
+      gezogen[t.kind] = (gezogen[t.kind] || 0) + 1;
+    }
+    log(s, "Das Heimatland ist ausgelegt, der Nebel liegt noch über dem Osten.");
+    erkl(s, null, () => {
+      const typ = (x) => Object.values(b.pos).filter((p) => p.type === x).length;
+      const dose = Object.values(s.nSeats >= 4 ? D.TILES_BIG : D.TILES_SMALL).reduce((a, x) => a + x, 0);
+      return { k: "heimatland", n: s.nSeats, gross: s.nSeats >= 4, dose, alle: Object.values(D.TILES_BIG).reduce((a, x) => a + x, 0),
+        plaetze: typ("home"), nebel: typ("fog"), gezogen, ruine, schatz, wasser: Object.values(s.tiles).filter((x) => x.kueste).length,
+        rest: s.bag.length, turm: s.tower, team: s.team };
+    });
+  },
+  startPlacement(s, st) {
+    if (!st.order) {
+      const o = order(s);
+      st.order = [...o, ...o.slice().reverse()];
+      st.i = 0;
+    }
+    if (st.i >= st.order.length) return;
+    const seat = st.order[st.i];
+    s.pending = { type: "placeStart", seat, second: st.i >= s.nSeats, step: st };
+  },
+  roundStart(s) {
+    s.round += 1;
+    s.journeyMoved = false;
+    s.taken = {};
+    s.planerinTook = {};
+    const n = Math.max(s.variants.minDice || 0, s.nSeats === 2 ? s.variants.diceTwoPlayers : s.nSeats + 1);
+    s.rolled = Array.from({ length: Math.min(6, n) }, () => D.DIE_FACES[rint(s, 6)]);
+    s.dice = s.rolled.slice();
+    if (s.variants.catchupRes && s.round > 1) {
+      const sc = s.seats.map((_, i) => (s.variants.catchupStart === "leiste" ? score(s, i).fame : score(s, i).leiste));
+      const hi = Math.max(...sc), lo = Math.min(...sc);
+      if (hi - lo >= s.variants.catchupRes) for (let i = 0; i < s.nSeats; i++) if (sc[i] === lo) {
+        const r = D.RES.reduce((a, x) => (s.seats[i].res[x] < s.seats[i].res[a] ? x : a), "holz");
+        gain(s, i, r, 1); s.stats.catchup = (s.stats.catchup || 0) + 1;
+      }
+    }
+    s.roundStats = { eyes: s.dice.filter((d) => d === "auge").length, overfallsWon: 0, overfallsLost: 0, sieges: 0 };
+    log(s, `Runde ${s.round}: ${seatName(s, s.start)} würfelt ${s.dice.map((d) => (d === "auge" ? "Auge" : D.TERRAIN_NAME[d])).join(", ")}.`);
+    erkl(s, s.start, () => ({
+      k: "wurf", n: s.rolled.length, sp: s.nSeats, basis: s.nSeats === 2 ? s.variants.diceTwoPlayers : s.nSeats + 1,
+      min: s.variants.minDice || 0, faces: s.rolled.slice(), augen: s.rolled.filter((d) => d === "auge").length,
+      plus: s.variants.ownPlus || 0, trost: !!s.variants.leerTrost,
+    }));
+    s.queue.unshift({ t: "reactRoll" }, { t: "eyes" }, { t: "planerin" }, { t: "turns" }, { t: "roundEnd" });
+  },
+  reactRoll(s, st) {
+    // Spürzauberin und Gelehrter, reihum ab dem Startspieler. Jeder Held wird je Wurf höchstens einmal gefragt (st.asked);
+    // eine Farbe mit beiden (Teamspiel) darf beide beim selben Wurf nutzen. Nach jeder Antwort beginnt die Runde von vorn:
+    // Dreht die Spürzauberin ein Auge herbei, wird ein Gelehrter, der vorher (ohne Auge) nicht gefragt war, noch gefragt.
+    if (!st.order) {
+      st.order = order(s);
+      st.i = 0;
+    }
+    gefragtAnlegen(st);
+    for (const seat of st.order) {
+      const can = {
+        zauberin: hasHero(s, seat, "zauberin") && !st.asked[`${seat}:zauberin`],
+        gelehrter: hasHero(s, seat, "gelehrter") && !st.asked[`${seat}:gelehrter`] && s.dice.includes("auge"),
+      };
+      if (can.zauberin || can.gelehrter) {
+        s.pending = { type: "reactRoll", seat, can, step: st };
+        return;
+      }
+    }
+    st.i = st.order.length;
+  },
+  eyes(s) {
+    const eyes = s.dice.filter((d) => d === "auge").length;
+    s.dice = s.dice.filter((d) => d !== "auge");
+    // Gelehrter (REGELN.md, Grenzfälle): Alle Augen dieses Wurfs kommen ohne Wirkung beiseite, auch eines, das die
+    // Spürzauberin danach noch herbeidreht
+    if (s.augenAus === s.round) {
+      s.stats.cancelledEyes += eyes;
+      return;
+    }
+    s.stats.eyes += eyes;
+    for (let k = 0; k < eyes && !s.over; k++) spawnHorde(s, { i: k + 1, n: eyes });
+  },
+  planerin(s, st) {
+    if (s.variants.planerinTurn) return;               // v0.5: die Planerin wirkt im eigenen Zug (TURN_ACTIONS.hero)
+    if (!st.order) {
+      st.order = order(s);
+      st.i = 0;
+    }
+    while (st.i < st.order.length) {
+      const seat = st.order[st.i];
+      if (hasHero(s, seat, "planerin") && s.dice.length >= 1) {
+        s.pending = { type: "planerin", seat, step: st };
+        return;
+      }
+      st.i++;
+    }
+  },
+  turns(s, st) {
+    if (st.i === undefined) st.i = 0;
+    if (st.i >= s.nSeats) return;
+    const seat = (s.start + st.i) % s.nSeats;
+    st.i++;
+    s.queue.unshift(st);
+    s.pending = { type: "turn", seat, dieTaken: !!s.planerinTook?.[seat] };
+    if (s.planerinTook?.[seat]) erkl(s, seat, { k: "zugOhneWuerfel" });
+  },
+  roundEnd(s) {
+    // 1. gemeinsame Ernte (für die Erklärung: je Würfel und Platz Soll und Ist)
+    const on = s.erklaeren !== false;
+    const teile = [];
+    s.dice.forEach((face, i) => {
+      for (const seat of order(s)) {
+        const soll = on ? harvestYield(s, seat, face, false).n : 0;
+        const ist = harvest(s, seat, face, false);
+        if (soll) teile.push([i, seat, soll, ist]);
+      }
+    });
+    if (s.dice.length) log(s, `Gemeinsame Ernte: ${s.dice.map((d) => D.TERRAIN_NAME[d]).join(", ")}.`);
+    erkl(s, null, () => ({ k: "gemeinsam", dice: s.dice.slice(), teile, plus: s.variants.ownPlus || 0,
+      kuesteBonus: (!s.variants.noKuesteErnte || s.variants.kuesteFischer || s.variants.kuesteWasserPlus) && s.seats.some((x) => x.people === "kuestenvolk") }));
+    s.dice = [];
+    s.queue.unshift({ t: "moveHordes" }, { t: "siege" }, { t: "overfalls" }, { t: "extinguish" }, { t: "quest" }, { t: "closeRound" });
+  },
+  moveHordes(s, st) {
+    const b = board(s);
+    if (!st.ids) {
+      st.ids = s.hordes.map((h) => h.id);
+      // vorn zuerst (nah an der Hauptstadt): So ist ein Feld frei, bevor der nächste Stapel hineinzieht (v0.5: Ringe zählen erst danach)
+      if (s.variants.hordeStack === "warten" || s.variants.rings) st.ids.sort((a, c) => b.dist[s.hordes.find((x) => x.id === a).pos] - b.dist[s.hordes.find((x) => x.id === c).pos]);
+      st.i = 0;
+      // Horden auf demselben Feld ziehen gemeinsam (REGELN.md, Rundenende 2): Ziel je Startfeld merken
+      st.from = Object.fromEntries(s.hordes.map((h) => [h.id, h.pos]));
+      st.dest = {};
+      erkl(s, null, () => {
+        const n = s.hordes.filter((h) => h.pos !== CAPITAL_KEY).length;
+        return n && { k: "hordenStart", n, felder: new Set(s.hordes.map((h) => h.pos)).size, tie: s.variants.hordeTie, ringe: !!s.variants.rings,
+          maxR: s.variants.rings || 0, turm: !s.variants.missingNoTower, haupt: !!s.variants.capitalNoRings };
+      });
+    }
+    st.dest ||= {};
+    st.from ||= {};
+    // Erklärung je Startfeld (beim ersten Zug von dort; die übrigen Horden des Feldes folgen ohne eigene)
+    const zugErkl = (origin, dest, grund) => erkl(s, grund === "wahl" ? s.start : null, () => {
+      const alle = b.pos[origin].nb.filter((f) => b.dist[f] === b.dist[origin] - 1);
+      return {
+        k: "hordenzug", von: kindOf(s, origin), nach: kindOf(s, dest), ri: richtung(s, origin, dest), ziel: dest === CAPITAL_KEY,
+        dist: b.dist[dest], grund, n: st.ids.filter((id) => st.from[id] === origin && s.hordes.some((x) => x.id === id)).length,
+        // gleich weite Nachbarn: [Gelände, Gebäude dort, Richtung, ist das Ziel]
+        opts: alle.length > 1 ? alle.map((f) => [kindOf(s, f), buildingsAt(s, f).length, richtung(s, origin, f), f === dest ? 1 : 0]) : null,
+        tie: s.variants.hordeTie, ringe: !!s.variants.rings,
+        dazu: s.hordes.filter((x) => x.pos === dest && st.from[x.id] !== origin).length,   // dort schon stehende Horden (Stapel)
+      };
+    });
+    const busy = (f, me) => s.hordes.some((x) => x.id !== me && x.pos === f);
+    const arrive = (h) => {            // verschmelzen: trifft die Horde auf eine andere, geht sie zurück, Turm +1
+      if (s.variants.hordeStack === "verschmelzen" && busy(h.pos, h.id)) {
+        s.stats.stackBlocked = (s.stats.stackBlocked || 0) + 1;
+        removeHordes(s, [h.id]);
+        towerGrow(s, 1, "Horden vereint");
+        return;
+      }
+      // v0.5: Braucht der Stapel einen Ring, den es nicht mehr gibt, geht die dazukommende Horde zurück in den Vorrat, Turm +1
+      // (seit 12.11.2026 ohne Turm +1: missingNoTower; in der Hauptstadt braucht es keine Ringe: capitalNoRings)
+      if (s.variants.rings && !(s.variants.capitalNoRings && h.pos === CAPITAL_KEY) && hordePieces(s).ringe > s.variants.rings) {
+        removeHordes(s, [h.id]);
+        s.stats.ringFehlt = (s.stats.ringFehlt || 0) + 1;
+        log(s, `Stapel auf ${D.TERRAIN_NAME[s.tiles[h.pos]?.kind] || "Nebel"}: Ein Ring fehlt, die dazukommende Horde geht zurück in den Vorrat.`);
+        erkl(s, null, () => ({ k: "ringFehlt", f: kindOf(s, h.pos), max: s.variants.rings, dort: hordesAt(s, h.pos).length, turm: !s.variants.missingNoTower }));
+        if (!s.variants.missingNoTower) towerGrow(s, 1, "kein Ring mehr im Vorrat");
+      }
+    };
+    while (st.i < st.ids.length) {
+      const h = s.hordes.find((x) => x.id === st.ids[st.i]);
+      if (!h || h.pos === CAPITAL_KEY) {
+        st.i++;
+        continue;
+      }
+      const origin = st.from[h.id] ?? h.pos;
+      if (st.choice) {
+        h.pos = st.choice;
+        st.dest[origin] = st.choice;
+        zugErkl(origin, st.choice, "wahl");
+        st.choice = null;
+        st.i++;
+        arrive(h);
+        if (s.over) return;
+        continue;
+      }
+      if (st.dest[origin] && s.variants.hordeStack !== "warten") {      // eine Horde dieses Feldes ist schon gezogen
+        h.pos = st.dest[origin];
+        st.i++;
+        arrive(h);
+        if (s.over) return;
+        continue;
+      }
+      const d = b.dist[h.pos];
+      let opts = b.pos[h.pos].nb.filter((f) => b.dist[f] === d - 1);
+      if (s.variants.hordeStack === "warten") {
+        opts = opts.filter((f) => !busy(f, h.id));
+        if (!opts.length) { s.stats.stackWait = (s.stats.stackWait || 0) + 1; st.i++; continue; }
+      }
+      const nAlle = opts.length;
+      if (opts.length > 1 && s.variants.hordeTie === "gebaeude") {
+        const cnt = (f) => buildingsAt(s, f).length;
+        const m = Math.max(...opts.map(cnt));
+        opts = opts.filter((f) => cnt(f) === m);
+      }
+      const nGeb = opts.length;
+      if (opts.length > 1 && s.variants.hordeTieRandom && opts.every((f) => !buildingsAt(s, f).length)) {
+        opts = [opts[rint(s, opts.length)]];        // ohne Gebäude ist es egal: Zufall statt Rückfrage
+      }
+      if (opts.length > 1) {
+        s.pending = { type: "hordeTie", seat: s.start, horde: h.id, from: h.pos, options: opts, step: st };
+        return;
+      }
+      h.pos = opts[0];
+      st.dest[origin] = opts[0];
+      zugErkl(origin, opts[0], nAlle === 1 ? "einzig" : nGeb === 1 ? "gebaeude" : "zufall");
+      st.i++;
+      arrive(h);
+      if (s.over) return;
+    }
+  },
+  siege(s) {
+    if (s.rufReady && s.hordes.length && s.tower >= s.variants.towerMax - 2) {
+      // Verbündete kommen: alle Horden im Heimatland und an der Hauptstadt vernichtet, Turm −1
+      const home = new Set(["capital", "home"]);
+      const gone = s.hordes.filter((h) => home.has(board(s).pos[h.pos].type)).map((h) => h.id);
+      if (gone.length) {
+        removeHordes(s, gone);
+        s.tower = Math.max(0, s.tower - (s.variants.rufTower || 1));
+        s.rufReady = false;
+        s.stats.rufFired = s.round;
+        log(s, `Die Verbündeten kommen: ${gone.length} Horden vernichtet, Turm ${s.tower}.`);
+      }
+    }
+    const at = hordesAt(s, CAPITAL_KEY);
+    if (at.length) s.queue.unshift({ t: "fight", field: CAPITAL_KEY, kind: "siege" });
+  },
+  overfalls(s) {
+    const seen = [];
+    for (const h of s.hordes) {
+      if (h.pos === CAPITAL_KEY || seen.includes(h.pos)) continue;
+      if (buildingsAt(s, h.pos).length) seen.push(h.pos);
+    }
+    // Reihenfolge: die nächsten an der Hauptstadt zuerst (die Hauptstadt selbst kam schon in siege dran); sind zwei Felder
+    // gleich nah, wählt seit 12.11.2026 der Startspieler (raidTieChoice), vorher entschied der Feldschlüssel
+    const b = board(s);
+    seen.sort((x, y) => b.dist[x] - b.dist[y] || (x < y ? -1 : 1));
+    erkl(s, null, () => {
+      const ohne = [...new Set(s.hordes.map((h) => h.pos))].filter((f) => f !== CAPITAL_KEY && !seen.includes(f));
+      if (!seen.length && !ohne.length) return null;            // keine Horde auf dem Brett: nichts zu sagen
+      const gleich = seen.some((f, i) => i && b.dist[f] === b.dist[seen[i - 1]]);
+      return { k: "ueberfaelle", mit: seen.map((f) => kindOf(s, f)), ohne: ohne.map((f) => [kindOf(s, f), hordesAt(s, f).length]), auto: true,
+        wahl: !!s.variants.raidTieChoice && gleich };
+    });
+    if (seen.length) s.queue.unshift({ t: "raidPick", fields: seen });
+  },
+  raidPick(s, st) {
+    // Überfälle der Reihe nach. Mit raidTieChoice wählt der Startspieler unter den gleich nahen Feldern (Entscheidung raidOrder).
+    const left = st.fields.filter((f) => hordesAt(s, f).length && buildingsAt(s, f).length);
+    if (!left.length) return;
+    const b = board(s);
+    const naechste = left.filter((f) => b.dist[f] === Math.min(...left.map((g) => b.dist[g])));
+    if (s.variants.raidTieChoice && naechste.length > 1 && !naechste.includes(st.choice)) {
+      s.pending = { type: "raidOrder", seat: s.start, options: naechste, step: st };
+      return;
+    }
+    const next = left.includes(st.choice) ? st.choice : left[0];
+    st.choice = null;
+    const rest = left.filter((f) => f !== next);
+    s.queue.unshift({ t: "fight", field: next, kind: "overfall" }, ...(rest.length ? [{ t: "raidPick", fields: rest }] : []));
+  },
+  fight(s, st) {
+    const f = st.field;
+    if (!st.stage) {
+      st.stage = "intervene";
+      st.order = order(s);
+      st.i = 0;
+      st.paid = {};
+    }
+    const chronistDa = board(s).dist[f] <= chronistReichweite(s);
+    if (st.stage === "intervene") {
+      while (st.i < st.order.length && !s.variants.heroTurnOnly) {     // v0.5: Helden nur im eigenen Zug
+        if (!hordesAt(s, f).length) break;
+        const seat = st.order[st.i];
+        const can = { hueterin: hasHero(s, seat, "hueterin"), chronist: hasHero(s, seat, "chronist") && chronistDa };
+        if (can.hueterin || can.chronist) {
+          s.pending = { type: "intervene", seat, field: f, kind: st.kind, hordes: hordesAt(s, f).map((h) => h.id), can, step: st };
+          return;
+        }
+        st.i++;
+      }
+      if (!hordesAt(s, f).length) {                 // alle Horden abgezogen
+        erkl(s, null, () => ({ k: "kampfFaelltAus", art: st.kind, f: kindOf(s, f) }));
+        return;
+      }
+      st.stage = "pay";
+      st.i = 0;
+      st.strength = hordeStrength(s) * hordesAt(s, f).length;
+      st.base = baseDefense(s, f) + (st.kind === "siege" ? (s.variants.capitalDefense || 0) : 0);
+      st.payers = st.base >= st.strength ? [] : (st.kind === "siege" && s.variants.siegeAllPay ? order(s) : payers(s, f));
+      if (st.kind === "siege") {
+        s.stats.siegeTotal = (s.stats.siegeTotal || 0) + 1;
+        if (!buildingsAt(s, f).length) s.stats.siegeNoBuild = (s.stats.siegeNoBuild || 0) + 1;
+        if (st.base < st.strength && !st.payers.length) s.stats.siegeNoPayers = (s.stats.siegeNoPayers || 0) + 1;
+      }
+      st.strength0 = st.strength;
+      erkl(s, null, () => {
+        const bs = buildingsAt(s, f);
+        return {
+          k: "kampf", art: st.kind, f: kindOf(s, f), horden: hordesAt(s, f).length, je: hordeStrength(s), staerke: st.strength, alleHaupt: !!s.variants.siegeAllPay,
+          ab: s.variants.strongFrom, stark: s.tower >= s.variants.strongFrom,
+          burgen: bs.filter((x) => x.level === 2).length, festungen: bs.filter((x) => x.level === 3).length,
+          haupt: st.kind === "siege" ? s.variants.capitalDefense || 0 : 0, basis: st.base, zahler: st.payers.slice(),
+          warum: st.base >= st.strength ? "reicht" : st.kind === "siege" && s.variants.siegeAllPay ? "alle"
+            : litBeaconNear(s, f) ? "leuchtfeuer" : "besitzer",
+          besitzer: [...new Set(bs.map((x) => x.seat))], lohn: !s.variants.noFightReward, payFame: s.variants.payFame || 0,
+          turmPlus: st.kind === "siege" ? s.variants.siegeTower : 1,
+        };
+      });
+    }
+    if (st.stage === "pay") {
+      const paid = () => Object.values(st.paid).reduce((a, x) => a + x, 0);
+      while (st.i < st.payers.length) {
+        const need = st.strength - st.base - paid();
+        if (need <= 0 && s.variants.payOrder === "v03") break;
+        const seat = st.payers[st.i];
+        const me = s.seats[seat];
+        if (me.res.erz + me.res.pferde > 0 || me.hand.includes("verstaerkung")) {
+          s.pending = { type: "pay", seat, field: f, kind: st.kind, need: Math.max(0, need), strength: st.strength,
+                        base: st.base, paidSoFar: paid(), step: st };
+          return;
+        }
+        st.i++;
+      }
+      st.stage = "resolve";
+    }
+    // Auflösen
+    const hs = hordesAt(s, f).map((h) => h.id);
+    const total = st.base + Object.values(st.paid).reduce((a, x) => a + x, 0);
+    const fname = D.TERRAIN_NAME[s.tiles[f]?.kind] || "Nebel";
+    // v0.5 (noFightReward): eine Regel für alle Überfälle, auch an der Hauptstadt; das Wort „Belagerung“ gibt es nicht mehr
+    const where = st.kind === "siege" && !s.variants.noFightReward ? `Belagerung der Hauptstadt (${hs.length} Horde${hs.length > 1 ? "n" : ""})`
+      : `Überfall auf ${fname} (${hs.length} Horde${hs.length > 1 ? "n" : ""})`;
+    // für die Erklärung: Ort, Stärke, Abwehr und wer was gezahlt hat (in der Reihenfolge ab dem Startspieler)
+    const ende = (x) => ({
+      k: "kampfEnde", art: st.kind, f: kindOf(s, f), horden: hs.length, staerke: st.strength, basis: st.base, summe: total,
+      gezahlt: st.order.filter((k) => st.paid[k] > 0).map((k) => [k, st.paid[k]]), lohn: !s.variants.noFightReward, ...x,
+    });
+    if (total >= st.strength) {
+      removeHordes(s, hs);
+      const paidSeats = Object.entries(st.paid).filter(([, x]) => x > 0).map(([k, x]) => [Number(k), x]);
+      if (s.variants.noFightReward) {                  // v0.5: Ruhm gab es schon beim Zahlen, sonst nichts
+        log(s, `${where} abgewehrt (${total} gegen ${st.strength}).`);
+        erkl(s, null, () => ende({ sieg: true }));
+      } else if (!paidSeats.length) {
+        const owners = [...new Set(buildingsAt(s, f).filter((x) => x.level >= 2).map((x) => x.seat))];
+        for (const o of owners) addFame(s, o, 1, "abwehr");
+        log(s, `${where} abgewehrt: Burgen und Festungen reichen${owners.length ? `, je 1 Ruhm für ${owners.map((o) => seatName(s, o)).join(", ")}` : ""}.`);
+        erkl(s, null, () => ende({ sieg: true, ruhm1: owners }));
+      } else {
+        const top = Math.max(...paidSeats.map(([, x]) => x));
+        const best = st.order.filter((k) => st.paid[k] === top);
+        const winners = s.variants.defenseTie === "alle" ? best : best.slice(0, 1);
+        for (const w of winners) {
+          addFame(s, w, 2, "horden");
+          giveFate(s, w);
+        }
+        for (const o of best.filter((k) => !winners.includes(k))) addFame(s, o, 1, "horden");
+        log(s, `${where} abgewehrt (${total} gegen ${st.strength}). ${winners.map((w) => seatName(s, w)).join(", ")}: 2 Ruhm und eine Schicksalskarte.`);
+        erkl(s, null, () => ende({ sieg: true, top, sieger: winners, gleich: best.filter((k) => !winners.includes(k)) }));
+      }
+      if (st.kind === "siege") s.stats.siegesWon++;
+      else s.stats.overfallsWon++;
+      s.roundStats.overfallsWon++;
+    } else {
+      log(s, `${where}: Abwehr gescheitert (${total} gegen ${st.strength}).`);
+      const verluste = knockDown(s, f);
+      erkl(s, null, () => ende({ sieg: false, verluste, turmPlus: st.kind === "siege" ? s.variants.siegeTower : 1 }));
+      if (st.kind === "siege") {
+        removeHordes(s, hs);
+        s.stats.siegesLost++;
+        towerGrow(s, s.variants.siegeTower, s.variants.noFightReward ? "Überfall verloren" : "Belagerung verloren");
+      } else {
+        s.stats.overfallsLost++;
+        towerGrow(s, 1, "Überfall verloren");
+      }
+      s.roundStats.overfallsLost++;
+    }
+    if (st.kind === "siege") s.roundStats.sieges++;
+  },
+  extinguish(s) {
+    if (s.variants.beaconsNeverOut) return;             // v0.5: Leuchtfeuer brennen immer
+    const b = board(s);
+    for (const [c, bc] of Object.entries(s.beacons)) {
+      if (bc.lit && b.corners[c].fields.some((f) => hordesAt(s, f).length)) {
+        bc.lit = false;
+        log(s, "Ein Leuchtfeuer erlischt.");
+        erkl(s, null, () => ({
+          k: "erlischt", fs: cornerKinds(s, c), an: b.corners[c].fields.filter((f) => hordesAt(s, f).length).map((f) => kindOf(s, f)),
+          brennen: litCount(s),
+        }));
+      }
+    }
+  },
+  quest(s) {
+    if (s.journeyMoved) s.idleRounds = 0; else s.idleRounds = (s.idleRounds || 0) + 1;
+    if (!s.variants.questClock || s.journeyMoved || s.journey >= 10) return;
+    if (s.variants.questEvery && s.idleRounds < s.variants.questEvery) return;
+    if (s.variants.questFrom && s.round < s.variants.questFrom) return;
+    s.idleRounds = 0;
+    s.stats.questAuto = (s.stats.questAuto || 0) + 1;
+    // Reise-Uhr (v0.5): ohne Kosten und ohne Ruhm; ein Gefahrenfeld lässt den Turm wachsen, vollendet ihn aber nie
+    const step = journeyStep(s);
+    s.journey = step.field;
+    log(s, `Niemand hat die Gefährten unterstützt: Sie ziehen allein auf Feld ${s.journey}.`);
+    const deckel = step.danger && !s.variants.dangerHorde && s.variants.dangerCap && s.tower + s.variants.dangerTower >= s.variants.towerMax;
+    erkl(s, null, () => ({ k: "reiseUhr", feld: s.journey, gefahr: step.danger, deckel, plus: s.variants.dangerTower, turm: s.tower,
+      max: s.variants.towerMax, ziel: s.journey >= 10 }));
+    if (step.danger) {
+      if (s.variants.dangerHorde) spawnHorde(s);
+      else if (deckel) log(s, "Gefahrenfeld: Der Turm wächst nicht über die letzte Stufe.");
+      else towerGrow(s, s.variants.dangerTower, "Gefahrenfeld");
+    }
+    if (s.journey >= 10) s.endAfterRound = true;
+  },
+  closeRound(s) {
+    s.stats.rounds.push({
+      round: s.round, tower: s.tower, journey: s.journey, eyes: s.roundStats.eyes, hordes: s.hordes.length,
+      overfallsWon: s.roundStats.overfallsWon, overfallsLost: s.roundStats.overfallsLost, sieges: s.roundStats.sieges,
+      beaconsLit: Object.values(s.beacons).filter((b) => b.lit).length,
+      fame: s.seats.map((_, i) => score(s, i).leiste), ringe: hordePieces(s).ringe,
+    });
+    if (s.endAfterRound || s.journey >= 10) {
+      endGame(s, false, "Die Gefährten haben den Feuerberg erreicht.");
+      return;
+    }
+    if (s.round >= 60) {
+      endGame(s, false, "Abbruch nach 60 Runden.");
+      return;
+    }
+    const alt = s.start;
+    s.start = (s.start + 1) % s.nSeats;
+    if (s.variants.catchupStart) {
+      // Startspieler wird, wer am wenigsten Ruhm hat (bei Gleichstand der Nächste in der Reihe).
+      // Prüfvariante "leiste": nur Ruhm ohne Gebäude (so stand die Leiste bis v0.3)
+      const sc = s.seats.map((_, i) => (s.variants.catchupStart === "leiste" ? score(s, i).fame : score(s, i).leiste));
+      const lo = Math.min(...sc);
+      for (let k = 0; k < s.nSeats; k++) { const i = (s.start + k) % s.nSeats; if (sc[i] === lo) { s.start = i; break; } }
+      erkl(s, s.start, () => ({ k: "startspieler", regel: "ruhm", alt, ruhm: sc, lo }));
+    } else erkl(s, s.start, () => ({ k: "startspieler", regel: "reihum", alt }));
+    s.queue.unshift({ t: "roundStart" });
+  },
+};
+
+function run(s) {
+  let guard = 0;
+  while (!s.over && !s.pending && s.queue.length) {
+    if (guard++ > 100000) throw new Error("Endlosschleife im Ablauf");
+    const st = s.queue.shift();
+    STEPS[st.t](s, st);
+  }
+}
+
+// ------------------------------------------------------------------ Bauen, Reisen, Kämpfen (im eigenen Zug)
+function explore(s, seat, edge) {
+  const b = board(s);
+  for (const f of b.edges[edge].fields) {
+    if (!emptyFog(s, f)) continue;
+    const t = s.bag.shift();
+    if (!t) continue;
+    s.tiles[f] = { kind: t.kind, model: t.model };
+    log(s, `${seatName(s, seat)} erkundet den Nebel: ${D.TERRAIN_NAME[t.kind]}${t.treasure ? " mit Schatz" : ""}.`, seat);
+    const karten = s.seats[seat].hand.length;
+    if (t.kind === "ruine" && !s.variants.noRuinReward) {   // v0.4: Ruine 1 Ruhm, 1 Karte; v0.5: eine Kachel ohne Ertrag
+      addFame(s, seat, 1, "ruine");
+      giveFate(s, seat);
+    }
+    if (s.variants.fateExplore) giveFate(s, seat);          // v0.5: wer erkundet, zieht 1 Schicksalskarte
+    erkl(s, seat, () => ({
+      k: "erkunden", kind: t.kind, schatz: !!t.treasure, horde: hordesAt(s, f).length,
+      karte: s.seats[seat].hand.length > karten || s.pending?.type === "discard", fuersErkunden: !!s.variants.fateExplore,
+      ruinLohn: !s.variants.noRuinReward,
+    }));
+    if (t.treasure) interrupt(s, { type: "treasure", seat });
+  }
+}
+function placeGehoeft(s, seat, edge) {
+  s.buildings[edge] = { seat, level: 1 };
+}
+/** Leuchtfeuer bauen (Platz und Kosten sind geprüft). karte: mit dem Wachfeuer (v0.5, ohne Holz) */
+function buildBeacon(s, seat, corner, c, karte) {
+  payRes(s, seat, c);
+  s.beacons[corner] = { lit: true };
+  addFame(s, seat, 2, "leuchtfeuer");
+  log(s, karte ? `${seatName(s, seat)} spielt Wachfeuer und baut ein Leuchtfeuer ohne Holz (+2 Ruhm).`
+    : `${seatName(s, seat)} baut ein Leuchtfeuer (+2 Ruhm).`, seat);
+  erkl(s, seat, () => ({
+    k: "leuchtfeuer", fs: cornerKinds(s, corner), kosten: { ...c }, rabatt: (D.COSTS.leuchtfeuer.stein || 0) - (c.stein || 0),
+    brennen: litCount(s), gebaut: Object.keys(s.beacons).length, max: s.variants.beacons, ruf: s.ruf ? 0 : rufNeed(s),
+    leiste: score(s, seat).leiste, immer: !!s.variants.beaconsNeverOut, karte: !!karte,
+  }));
+  checkRuf(s, seat);
+}
+/** Kosten eines Leuchtfeuers mit dem Wachfeuer (v0.5): ohne Holz, Zwerge zusätzlich 1 Stein weniger */
+export function wachfeuerCost(s, seat) {
+  const c = costFor(s, seat, "leuchtfeuer");
+  delete c.holz;
+  return c;
+}
+
+/** quelle (nur für die Erklärung): "reise", "eilbote" oder "wegweiserin" */
+function doJourney(s, seat, how, quelle = "reise") {
+  const step = journeyStep(s);
+  if (!step) throw new Error("Die Gefährten sind schon am Feuerberg");
+  if (how !== "weg") payRes(s, seat, step.cost);
+  s.journey = step.field;
+  addFame(s, seat, step.fame, "reise");
+  log(s, `${seatName(s, seat)} führt die Gefährten auf Feld ${s.journey} (+${step.fame} Ruhm).`, seat);
+  erkl(s, seat, () => ({
+    k: "reise", wie: quelle, feld: s.journey, kosten: how === "weg" ? {} : { ...step.cost }, ruhm: step.fame, gefahr: step.danger,
+    // Folge eines Gefahrenfelds, so wie sie gleich darunter eintritt
+    folge: !step.danger ? null : how === "weg" ? "weg" : s.seats[seat].people === "halblinge" && s.variants.halblinge !== "B" ? "halblinge"
+      : s.variants.dangerHorde ? "horde"
+      : s.variants.dangerCap && s.tower + s.variants.dangerTower >= s.variants.towerMax ? "deckel" : "turm",
+    plus: s.variants.dangerTower, turm: s.tower, max: s.variants.towerMax, ziel: s.journey >= 10, leiste: score(s, seat).leiste,
+    held: !!s.variants.heldDesWestens,
+  }));
+  if (step.danger && how !== "weg") {
+    if (s.seats[seat].people === "halblinge" && s.variants.halblinge !== "B") log(s, "Die Halblinge schleichen vorbei: Der Turm wächst nicht.", seat);
+    else if (s.variants.dangerHorde) spawnHorde(s);
+    else if (s.variants.dangerCap && s.tower + s.variants.dangerTower >= s.variants.towerMax) log(s, "Gefahrenfeld: Der Turm wächst nicht über die letzte Stufe.");
+    else towerGrow(s, s.variants.dangerTower, "Gefahrenfeld");
+  }
+  if (s.journey >= 10) {
+    s.endAfterRound = true;
+    log(s, "Die Gefährten erreichen den Feuerberg! Die Runde wird zu Ende gespielt.");
+  }
+}
+
+function fightPower(s, seat, pay) {
+  const erz = pay.erz | 0;
+  const pferde = pay.pferde | 0;
+  const me = s.seats[seat];
+  if (erz < 0 || pferde < 0 || erz > me.res.erz || pferde > me.res.pferde) throw new Error("So viel hast du nicht");
+  if (pay.verstaerkung && !me.hand.includes("verstaerkung")) throw new Error("Keine Verstärkung auf der Hand");
+  return erz + pferde * horseValue(s, seat) + (pay.verstaerkung ? 3 : 0);
+}
+function spendFight(s, seat, pay) {
+  payRes(s, seat, { erz: pay.erz | 0, pferde: pay.pferde | 0 });
+  if (pay.verstaerkung) takeCard(s, seat, "verstaerkung");
+}
+
+const TURN_ACTIONS = {
+  takeDie(s, seat, a, p) {
+    if (p.dieTaken) throw new Error("Du hast schon einen Würfel");
+    const i = a.index | 0;
+    if (i < 0 || i >= s.dice.length) throw new Error("Diesen Würfel gibt es nicht");
+    let face = s.dice[i];
+    if (a.face && a.face !== face) {
+      if (s.seats[seat].people !== "elben") throw new Error("Nur Elben dürfen den Würfel drehen");
+      if (!D.TERRAIN_RES[a.face]) throw new Error("Nur auf ein Gelände drehen");
+      const ek = s.variants.elbenCost ?? 2;
+      if (s.seats[seat].res.korn < ek) throw new Error(`Drehen kostet ${ek} Korn`);
+      if (ek) payRes(s, seat, { korn: ek });
+      log(s, `${seatName(s, seat)} dreht den Würfel für ${ek} Korn auf ${D.TERRAIN_NAME[a.face]}.`, seat);
+      erkl(s, seat, { k: "elben", von: face, nach: a.face, kosten: ek });
+      face = a.face;
+    }
+    s.dice.splice(i, 1);
+    s.taken[seat] = [...(s.taken[seat] || []), face];
+    p.dieTaken = true;
+    log(s, `${seatName(s, seat)} nimmt ${D.TERRAIN_NAME[face]}.`, seat);
+    harvestOwn(s, seat, face, p, "wuerfel");
+  },
+  // 1 beliebiger Rohstoff: wenn kein Würfel mehr liegt oder (leerTrost) der eigene Würfel nichts gebracht hat (p.trost).
+  // Nur Sorten, die im Vorrat sind (ist der Vorrat ganz leer, gibt es nichts).
+  takeResource(s, seat, a, p) {
+    const trost = (p.trost || 0) > 0;
+    if (!trost) {
+      if (p.dieTaken) throw new Error("Du hast schon geerntet");
+      if (s.dice.length) throw new Error("Es liegen noch Würfel");
+    }
+    if (!D.RES.includes(a.res)) throw new Error("Unbekannter Rohstoff");
+    if (s.supply[a.res] < 1 && vorratDa(s)) throw new Error("Davon ist nichts mehr im Vorrat");
+    if (trost) p.trost -= 1;
+    else p.dieTaken = true;
+    const got = gain(s, seat, a.res, 1);
+    log(s, `${seatName(s, seat)} nimmt 1 ${D.RES_NAME[a.res]} aus dem Vorrat.`, seat);
+    erkl(s, seat, { k: "rohstoffWahl", res: a.res, ist: got, grund: trost ? "ertrag" : "wuerfel" });
+  },
+  build(s, seat, a) {
+    if (pieceUse(s, seat).gehoeft >= D.PIECES.gehoeft) throw new Error("Keine Gehöfte mehr");
+    if (!legalGehoeftEdges(s, seat).includes(a.edge)) throw new Error("Hier darfst du nicht bauen");
+    const c = costFor(s, seat, "gehoeft");
+    if (!canAfford(s, seat, c)) throw new Error("Zu wenig Rohstoffe");
+    const neu = erklVor(s, () => ({ neu: !seatFields(s, seat).size }));    // ohne Gebäude: wieder im Heimatland
+    payRes(s, seat, c);
+    explore(s, seat, a.edge);
+    placeGehoeft(s, seat, a.edge);
+    log(s, `${seatName(s, seat)} baut ein Gehöft.`, seat);
+    erkl(s, seat, () => ({
+      k: "gehoeft", fs: edgeKinds(s, a.edge), kosten: { ...c }, neu: !!neu?.neu,
+      rest: D.PIECES.gehoeft - pieceUse(s, seat).gehoeft, leiste: score(s, seat).leiste,
+    }));
+  },
+  upgrade(s, seat, a) {
+    const up = legalUpgrades(s, seat).find((x) => x.edge === a.edge);
+    if (!up) throw new Error("Hier geht kein Ausbau");
+    const what = up.to === 2 ? "burg" : "festung";
+    const c = costFor(s, seat, what);
+    if (!canAfford(s, seat, c)) throw new Error("Zu wenig Rohstoffe");
+    payRes(s, seat, c);
+    s.buildings[a.edge].level = up.to;
+    log(s, `${seatName(s, seat)} baut eine ${D.LEVEL_NAME[up.to]}.`, seat);
+    erkl(s, seat, () => ({
+      k: "ausbau", to: up.to, fs: edgeKinds(s, a.edge), kosten: { ...c }, rabatt: (D.COSTS[what].stein || 0) - (c.stein || 0),
+      leiste: score(s, seat).leiste,
+    }));
+  },
+  beacon(s, seat, a) {
+    if (!legalBeaconCorners(s, seat).includes(a.corner)) throw new Error("Hier darf kein Leuchtfeuer stehen");
+    const c = costFor(s, seat, "leuchtfeuer");
+    if (!canAfford(s, seat, c)) throw new Error("Zu wenig Rohstoffe");
+    buildBeacon(s, seat, a.corner, c, false);
+  },
+  relight(s, seat, a) {
+    if (s.variants.beaconsNeverOut) throw new Error("Leuchtfeuer erlöschen nicht");
+    const bc = s.beacons[a.corner];
+    if (!bc || bc.lit) throw new Error("Dieses Leuchtfeuer brennt schon");
+    if (!canAfford(s, seat, D.COSTS.flamme)) throw new Error("Es fehlt Holz");
+    payRes(s, seat, D.COSTS.flamme);
+    bc.lit = true;
+    log(s, `${seatName(s, seat)} entzündet ein Leuchtfeuer neu.`, seat);
+    erkl(s, seat, () => ({ k: "entzuenden", fs: cornerKinds(s, a.corner), brennen: litCount(s), ruf: s.ruf ? 0 : rufNeed(s) }));
+    checkRuf(s, seat);
+  },
+  reise(s, seat) {
+    if (s.journeyMoved) throw new Error("Die Gefährten sind diese Runde schon gezogen");
+    const step = journeyStep(s);
+    if (!step) throw new Error("Die Reise ist zu Ende");
+    if (!canAfford(s, seat, step.cost)) throw new Error("Zu wenig Rohstoffe");
+    s.journeyMoved = true;
+    doJourney(s, seat, "zahlen");
+  },
+  ausfall(s, seat, a) {
+    const t = ausfallTargets(s, seat).find((x) => x.field === a.field);
+    if (!t) throw new Error("Hier ist keine Horde an deinen Gebäuden");
+    const power = fightPower(s, seat, a);
+    if (power < t.need) throw new Error(`Zu wenig Abwehr (${power} von ${t.need})`);
+    const vorher = erklVor(s, () => ({
+      k: "ausfall", f: kindOf(s, a.field), horden: hordesAt(s, a.field).length, je: hordeStrength(s),
+      stark: s.tower >= s.variants.strongFrom, ab: s.variants.strongFrom,
+      staerke: hordeStrength(s) * hordesAt(s, a.field).length, basis: baseDefense(s, a.field, seat), need: t.need,
+      erz: a.erz | 0, pferde: a.pferde | 0, verst: !!a.verstaerkung, hv: horseValue(s, seat), wert: power,
+    }));
+    spendFight(s, seat, a);
+    removeHordes(s, hordesAt(s, a.field).map((h) => h.id));
+    addFame(s, seat, 2, "horden");
+    s.stats.ausfaelle++;
+    log(s, `${seatName(s, seat)} wagt einen Ausfall und vernichtet die Horde (+2 Ruhm).`, seat);
+    erkl(s, seat, vorher);
+    giveFate(s, seat);
+  },
+  bank(s, seat, a) {
+    const rate = bankRate(s, seat);
+    if (!D.RES.includes(a.give) || !D.RES.includes(a.get) || a.give === a.get) throw new Error("Ungültiger Tausch");
+    if (s.seats[seat].res[a.give] < rate) throw new Error(`Du brauchst ${rate} ${D.RES_NAME[a.give]}`);
+    if (s.supply[a.get] < 1) throw new Error("Der Vorrat ist leer");
+    payRes(s, seat, { [a.give]: rate });
+    gain(s, seat, a.get, 1);
+    log(s, `${seatName(s, seat)} tauscht ${rate} ${D.RES_NAME[a.give]} gegen 1 ${D.RES_NAME[a.get]}.`, seat);
+    erkl(s, seat, () => {
+      // Grund für einen besseren Kurs (wie bankRate): Gebäude an der Hauptstadt, Küstenvolk am Wasser
+      const b = board(s);
+      let haupt = false, kueste = false;
+      for (const [e, bl] of Object.entries(s.buildings)) {
+        if (bl.seat !== seat) continue;
+        const fs = b.edges[e].fields;
+        if (fs.includes(CAPITAL_KEY) && s.variants.capitalRate < s.variants.bankRate) haupt = true;
+        if (!s.variants.noHafen && s.seats[seat].people === "kuestenvolk" && fs.some((f) => s.tiles[f]?.kind === "wasser") && 2 < s.variants.bankRate) kueste = true;
+      }
+      return { k: "tausch", kurs: rate, basis: s.variants.bankRate, haupt, kueste, gib: a.give, nimm: a.get };
+    });
+  },
+  offer(s, seat, a) {
+    const to = a.to | 0;
+    if (to === seat || to < 0 || to >= s.nSeats) throw new Error("Ungültiger Handelspartner");
+    const give = clean(a.give);
+    const get = clean(a.get);
+    if (!Object.keys(give).length && !Object.keys(get).length) throw new Error("Leeres Angebot");
+    // seit 12.11.2026: nur Rohstoffe gegen Rohstoffe, beide Seiten geben mindestens einen (kein Verschenken)
+    if (s.variants.tradeBothSides && (!Object.keys(give).length || !Object.keys(get).length)) throw new Error("Beide Seiten geben mindestens einen Rohstoff");
+    if (!canAfford(s, seat, give)) throw new Error("Das hast du nicht");
+    interrupt(s, { type: "tradeOffer", seat: to, from: seat, give, get });
+  },
+  fate(s, seat, a) {
+    const me = s.seats[seat];
+    if (!me.hand.includes(a.card)) throw new Error("Diese Karte hast du nicht");
+    switch (a.card) {
+      case "eilbote": {
+        const step = journeyStep(s);
+        if (!step) throw new Error("Die Reise ist zu Ende");
+        if (!canAfford(s, seat, step.cost)) throw new Error("Zu wenig Rohstoffe");
+        takeCard(s, seat, "eilbote");
+        log(s, `${seatName(s, seat)} spielt den Eilboten.`, seat);
+        doJourney(s, seat, "zahlen", "eilbote");
+        break;
+      }
+      case "ernte": {
+        const faces = s.taken[seat] || [];
+        const face = a.face && faces.includes(a.face) ? a.face : faces[0];
+        if (!face) throw new Error("Du hast diese Runde keinen Würfel genommen");
+        takeCard(s, seat, "ernte");
+        log(s, `${seatName(s, seat)} spielt Reiche Ernte.`, seat);
+        harvest(s, seat, face, true, "karte");
+        break;
+      }
+      case "bann": {
+        const h = s.hordes.find((x) => x.id === a.horde);
+        if (!h) throw new Error("Diese Horde gibt es nicht");
+        if (s.variants.bannAussen && h.pos === TOWER_GATE) throw new Error("Diese Horde steht schon auf dem Turm-Tor");
+        const von = kindOf(s, h.pos);
+        takeCard(s, seat, "bann");
+        const wohin = zumTurmTor(s, h);
+        log(s, wohin === "vorrat" ? `${seatName(s, seat)} spielt den Bannspruch: Am Turm-Tor fehlt Figur oder Ring, die Horde kommt in den Vorrat.`
+          : `${seatName(s, seat)} spielt den Bannspruch: Eine Horde muss zurück aufs Turm-Tor.`, seat);
+        erkl(s, seat, { k: "karte", id: "bann", von, vorrat: wohin === "vorrat" });
+        break;
+      }
+      case "wachfeuer": {
+        if (s.variants.wachfeuerBau) {                  // v0.5: ein Leuchtfeuer ohne Holz bauen
+          if (!legalBeaconCorners(s, seat).includes(a.corner)) throw new Error("Hier darf kein Leuchtfeuer stehen");
+          const c = wachfeuerCost(s, seat);
+          if (!canAfford(s, seat, c)) throw new Error("Zu wenig Rohstoffe");
+          takeCard(s, seat, "wachfeuer");
+          buildBeacon(s, seat, a.corner, c, true);
+          break;
+        }
+        const dark = Object.values(s.beacons).filter((b) => !b.lit);
+        if (!dark.length) throw new Error("Kein Leuchtfeuer ist erloschen");
+        takeCard(s, seat, "wachfeuer");
+        for (const b of dark) b.lit = true;
+        log(s, `${seatName(s, seat)} spielt Wachfeuer: ${dark.length} Leuchtfeuer brennen wieder.`, seat);
+        erkl(s, seat, () => ({ k: "karte", id: "wachfeuer", n: dark.length, brennen: litCount(s), ruf: s.ruf ? 0 : rufNeed(s) }));
+        checkRuf(s, seat);
+        break;
+      }
+      case "handel": {
+        const swaps = (a.swaps || []).slice(0, 3);
+        if (!swaps.length) throw new Error("Kein Tausch angegeben");
+        const need = {};
+        for (const [g, t] of swaps) {
+          if (!D.RES.includes(g) || !D.RES.includes(t)) throw new Error("Ungültiger Tausch");
+          need[g] = (need[g] || 0) + 1;
+        }
+        if (!canAfford(s, seat, need)) throw new Error("Das hast du nicht");
+        // Vorrat prüfen, bevor etwas genommen wird (vorher ging bei leerem Vorrat der Rohstoff verloren)
+        const want = {};
+        for (const [, t] of swaps) want[t] = (want[t] || 0) + 1;
+        for (const [t, n] of Object.entries(want)) if (s.supply[t] < n) throw new Error(`Im Vorrat ist nicht genug ${D.RES_NAME[t]}`);
+        takeCard(s, seat, "handel");
+        for (const [g, t] of swaps) {
+          payRes(s, seat, { [g]: 1 });
+          gain(s, seat, t, 1);
+        }
+        log(s, `${seatName(s, seat)} spielt den Handelszug (${swaps.length}-mal 1 : 1).`, seat);
+        erkl(s, seat, () => ({ k: "karte", id: "handel", swaps: swaps.map(([g, t]) => [g, t]) }));
+        break;
+      }
+      default:
+        throw new Error("Diese Karte wirkt nur bei einem Kampf");
+    }
+  },
+  hero(s, seat, a, p) {
+    if (!hasHero(s, seat, a.hero)) throw new Error("Diesen Helden hast du nicht (mehr)");
+    switch (a.hero) {
+      case "planerin": {                                // v0.5: im eigenen Zug 2 Würfel statt 1, beide ernten
+        if (!s.variants.planerinTurn) throw new Error("Dieser Held wirkt zu einem anderen Zeitpunkt");
+        if (p.dieTaken) throw new Error("Du hast schon einen Würfel");
+        if (s.variants.planerinZwei && s.dice.length < 2) throw new Error("Die Planerin braucht 2 Würfel");
+        const idx = [...new Set((a.dice || []).map((x) => x | 0))].filter((i) => i >= 0 && i < s.dice.length).slice(0, 2);
+        if (!idx.length || idx.length < Math.min(2, s.dice.length)) throw new Error("Wähle 2 Würfel");
+        // elbenPlanerin (9.11.2026): Elben dürfen jeden der beiden Würfel für je 1 Korn drehen; a.faces[j] gehört zu a.dice[j]
+        const dreh = {};
+        if (Array.isArray(a.faces)) {
+          (a.dice || []).forEach((x, j) => { if (a.faces[j] && idx.includes(x | 0) && a.faces[j] !== s.dice[x | 0]) dreh[x | 0] = a.faces[j]; });
+        }
+        const nDreh = Object.keys(dreh).length;
+        const ek = s.variants.elbenCost ?? 2;
+        if (nDreh) {
+          if (!s.variants.elbenPlanerin || s.seats[seat].people !== "elben") throw new Error("Nur Elben dürfen den Würfel drehen");
+          if (Object.values(dreh).some((f) => !D.TERRAIN_RES[f])) throw new Error("Nur auf ein Gelände drehen");
+          if (s.seats[seat].res.korn < ek * nDreh) throw new Error(`Drehen kostet ${ek} Korn je Würfel`);
+        }
+        useHero(s, seat, "planerin");
+        for (const [i, f] of Object.entries(dreh)) {
+          if (ek) payRes(s, seat, { korn: ek });
+          log(s, `${seatName(s, seat)} dreht den Würfel für ${ek} Korn auf ${D.TERRAIN_NAME[f]}.`, seat);
+          erkl(s, seat, { k: "elben", von: s.dice[i], nach: f, kosten: ek, planerin: true });
+        }
+        const faces = idx.map((i) => dreh[i] || s.dice[i]);
+        s.dice = s.dice.filter((_, i) => !idx.includes(i));
+        s.taken[seat] = [...(s.taken[seat] || []), ...faces];
+        p.dieTaken = true;
+        log(s, `${seatName(s, seat)} nutzt die Planerin und nimmt ${faces.map((f) => D.TERRAIN_NAME[f]).join(" und ")}.`, seat);
+        erkl(s, seat, { k: "planerin", faces: faces.slice(), imZug: true });
+        for (const f of faces) harvestOwn(s, seat, f, p, "planerin");
+        break;
+      }
+      case "karten": {
+        const got = drawFate(s, seat, 3);
+        useHero(s, seat, "karten");
+        const ruhm = s.variants.kartenFame || 0;                         // seit 12.11.2026: +1 Ruhm
+        if (ruhm) addFame(s, seat, ruhm, "held");
+        log(s, `${seatName(s, seat)} nutzt den Meister der Karten${ruhm ? ` (+${ruhm} Ruhm)` : ""}.`, seat);
+        erkl(s, seat, { k: "held", id: "karten", n: got.length, ruhm });   // welche Karten, bleibt verdeckt
+        if (got.length <= 2) {
+          s.seats[seat].hand.push(...got);
+          checkHand(s, seat);
+        } else interrupt(s, { type: "keepCards", seat, cards: got });
+        break;
+      }
+      case "tueftler": {
+        const up = legalUpgrades(s, seat).find((x) => x.edge === a.edge && x.to === 2);
+        if (!up) throw new Error("Wähle ein eigenes Gehöft");
+        if (s.variants.tueftlerCost) { if (!canAfford(s, seat, s.variants.tueftlerCost)) throw new Error("Zu wenig"); payRes(s, seat, s.variants.tueftlerCost); }
+        useHero(s, seat, "tueftler");
+        s.buildings[a.edge].level = 2;
+        const tk = s.variants.tueftlerCost;
+        const tkText = tk ? "für " + Object.entries(tk).map(([r, n]) => `${n} ${D.RES_NAME[r]}`).join(" und ") : "ohne Kosten";
+        log(s, `${seatName(s, seat)} baut mit dem Tüftler eine Burg ${tkText}.`, seat);
+        erkl(s, seat, () => ({ k: "held", id: "tueftler", fs: edgeKinds(s, a.edge), kosten: { ...(tk || {}) }, leiste: score(s, seat).leiste }));
+        break;
+      }
+      case "wegweiserin": {
+        const step = journeyStep(s);
+        if (s.journeyMoved) throw new Error("Die Gefährten sind diese Runde schon gezogen");
+        if (!step || step.field >= 10) throw new Error("Nicht auf Feld 10");
+        useHero(s, seat, "wegweiserin");
+        s.journeyMoved = true;
+        log(s, `${seatName(s, seat)} nutzt die Wegweiserin.`, seat);
+        doJourney(s, seat, "weg", "wegweiserin");
+        break;
+      }
+      case "hueterin":
+      case "chronist":
+        heroHorde(s, seat, a.hero, a.horde, null);
+        break;
+      default:
+        throw new Error("Dieser Held wirkt zu einem anderen Zeitpunkt");
+    }
+  },
+  endTurn(s, seat, a, p) {
+    if (!p.dieTaken) throw new Error("Nimm zuerst einen Würfel (oder einen Rohstoff)");
+    log(s, `${seatName(s, seat)} beendet den Zug.`, seat);
+    erkl(s, seat, () => {
+      const next = (seat + 1) % s.nSeats;
+      return { k: "zugEnde", next: next === s.start ? null : next, dice: s.dice.slice(), planerin: !!s.planerinTook?.[next], ende: !!s.endAfterRound };
+    });
+    finishPending(s, null);
+  },
+};
+
+/** kampf (nur für die Erklärung): "overfall"/"siege", wenn der Held vor einem Kampf gerufen wird, sonst null */
+function heroHorde(s, seat, hero, hordeId, kampf = null) {
+  const h = s.hordes.find((x) => x.id === hordeId);
+  if (!h) throw new Error("Diese Horde gibt es nicht");
+  const weit = chronistReichweite(s);
+  if (hero === "chronist" && !(board(s).dist[h.pos] <= weit)) {
+    throw new Error(weit <= 1 ? "Nur auf oder neben der Hauptstadt" : `Nur Horden bis ${weit} Felder vor der Hauptstadt`);
+  }
+  if (hero === "hueterin" && s.variants.bannAussen && h.pos === TOWER_GATE) throw new Error("Diese Horde steht schon auf dem Turm-Tor");
+  const pos = h.pos;
+  const ruhm = hero === "hueterin" ? s.variants.hueterinFame ?? 2 : s.variants.chronistFame ?? 2;
+  useHero(s, seat, hero);
+  if (ruhm) addFame(s, seat, ruhm, "held");
+  let vorrat = false;
+  if (hero === "hueterin") {
+    vorrat = zumTurmTor(s, h) === "vorrat";
+    log(s, vorrat ? `${seatName(s, seat)} ruft die Hüterin der Natur: Am Turm-Tor fehlt Figur oder Ring, die Horde kommt in den Vorrat (+${ruhm} Ruhm).`
+      : s.variants.bannAussen ? `${seatName(s, seat)} ruft die Hüterin der Natur: Eine Horde kehrt aufs Turm-Tor zurück (+${ruhm} Ruhm).`
+        : `${seatName(s, seat)} ruft die Hüterin der Natur: Eine Horde kehrt ohne Kampf aufs Turm-Tor zurück (+${ruhm} Ruhm).`, seat);
+  } else {
+    removeHordes(s, [h.id]);
+    log(s, `${seatName(s, seat)} ruft den Chronisten: Eine Horde zieht ab (+${ruhm} Ruhm).`, seat);
+  }
+  erkl(s, seat, () => ({ k: "held", id: hero, von: kindOf(s, pos), rest: pos === TOWER_GATE ? 0 : hordesAt(s, pos).length, kampf, ruhm,
+    weit, dist: board(s).dist[pos], vorrat, neu: !!s.variants.bannAussen }));
+}
+/** Hüterin und Bannspruch: Horde zurück aufs Turm-Tor. Fehlt dort die nötige Figur oder der Ring (bannAussen), kommt sie
+ *  stattdessen in den Vorrat (ohne Turm +1). -> "turm" oder "vorrat" */
+function zumTurmTor(s, h) {
+  if (s.variants.bannAussen && teilFehltNach(s, h, TOWER_GATE)) {
+    removeHordes(s, [h.id]);
+    return "vorrat";
+  }
+  h.pos = TOWER_GATE;
+  return "turm";
+}
+
+function clean(o) {
+  const out = {};
+  for (const r of D.RES) if ((o?.[r] | 0) > 0) out[r] = o[r] | 0;
+  return out;
+}
+
+// ------------------------------------------------------------------ Entscheidungen auflösen
+const DECISIONS = {
+  chooseHero(s, p, a) {
+    if (!p.offer.includes(a.hero)) throw new Error("Wähle einen der beiden Helden");
+    s.seats[p.seat].heroes = [{ id: a.hero, used: false }];
+    s.seats[p.seat].heroOffer = null;
+    erkl(s, p.seat, { k: "heldWahl", art: "zwei", ids: [a.hero] });
+    p.step.i++;
+    finishPending(s, p.step);
+  },
+  placeWater(s, p, a) {
+    const b = board(s);
+    if (!b.pos[a.pos] || b.pos[a.pos].type !== "home" || s.tiles[a.pos]) throw new Error("Wähle einen freien Heimatland-Platz");
+    const i = s.bag.findIndex((t) => t.kind === "wasser");
+    const t = s.bag.splice(i, 1)[0];
+    s.tiles[a.pos] = { kind: "wasser", model: t.model, kueste: true };      // das eigene Wasser des Küstenvolks
+    log(s, `Das Küstenvolk (${seatName(s, p.seat)}) legt sein Wasser ins Heimatland.`, p.seat);
+    // Prüfvariante: Küstenvolk bekommt beim Aufbau Rohstoffe (z. B. {holz: 1, korn: 1})
+    for (const [r, k] of Object.entries(s.variants.kuesteStart || {})) gain(s, p.seat, r, k);
+    erkl(s, p.seat, { k: "wasser", ernte: !s.variants.noKuesteErnte, fischer: !!s.variants.kuesteFischer, wasserPlus: s.variants.kuesteWasserPlus || 0,
+      hafen: !s.variants.noHafen, start: { ...(s.variants.kuesteStart || {}) } });
+    p.step.done = true;
+    finishPending(s, p.step);
+  },
+  placeStart(s, p, a) {
+    if (!legalGehoeftEdges(s, p.seat, true).includes(a.edge)) throw new Error("Nur auf freie Kanten im Heimatland");
+    placeGehoeft(s, p.seat, a.edge);
+    log(s, `${seatName(s, p.seat)} setzt ein Start-Gehöft.`, p.seat);
+    const ertrag = {};
+    if (p.second) {
+      const b = board(s);
+      for (const f of b.edges[a.edge].fields) {
+        const r = D.TERRAIN_RES[s.tiles[f]?.kind];
+        if (r) ertrag[r] = (ertrag[r] || 0) + gain(s, p.seat, r, 1);
+      }
+    }
+    erkl(s, p.seat, () => ({ k: "startGehoeft", zweites: !!p.second, fs: edgeKinds(s, a.edge), ertrag, ruhm: s.variants.startRuhm ? 1 : 0,
+      leiste: score(s, p.seat).leiste }));
+    p.step.i++;
+    finishPending(s, p.step);
+  },
+  reactRoll(s, p, a) {
+    if (a.type === "zauberin") {
+      if (!p.can.zauberin) throw new Error("Nicht möglich");
+      const ch = (a.changes || []).slice(0, 2);
+      for (const c of ch) {
+        if (c.i < 0 || c.i >= s.dice.length || !D.DIE_FACES.includes(c.face)) throw new Error("Ungültiger Würfel");
+      }
+      useHero(s, p.seat, "zauberin");
+      if (s.variants.zauberinFame) addFame(s, p.seat, s.variants.zauberinFame, "held");
+      const alt = ch.map((c) => s.dice[c.i]);
+      for (const c of ch) s.dice[c.i] = c.face;
+      log(s, `${seatName(s, p.seat)} ruft die Spürzauberin und dreht ${ch.length} Würfel.`, p.seat);
+      erkl(s, p.seat, () => ({
+        k: "zauberin", aend: ch.map((c, j) => [alt[j], c.face]), ruhm: s.variants.zauberinFame || 0,
+        augen: s.dice.filter((d) => d === "auge").length,
+      }));
+      // gleicher Spieler darf danach nicht noch einmal gefragt werden; Gelehrter ist eine andere Karte
+    } else if (a.type === "gelehrter") {
+      if (!p.can.gelehrter) throw new Error("Nicht möglich");
+      useHero(s, p.seat, "gelehrter");
+      const n = s.dice.filter((d) => d === "auge").length;
+      s.dice = s.dice.filter((d) => d !== "auge");
+      s.stats.cancelledEyes += n;
+      s.augenAus = s.round;               // auch später in diesem Wurf gedrehte Augen zählen nicht
+      addFame(s, p.seat, 2, "held");
+      log(s, `${seatName(s, p.seat)}: Pax vobiscum! ${n} Augen zählen nicht (+2 Ruhm).`, p.seat);
+      erkl(s, p.seat, { k: "gelehrter", n, ruhm: 2 });
+    } else if (a.type !== "pass") throw new Error("Unbekannte Antwort");
+    // gefragt ist, was angeboten war: beim Passen beide, sonst nur der genutzte Held (der andere darf noch)
+    gefragtAnlegen(p.step);
+    for (const hero of ["zauberin", "gelehrter"]) if (p.can[hero] && (a.type === "pass" || a.type === hero)) p.step.asked[`${p.seat}:${hero}`] = true;
+    finishPending(s, p.step);
+  },
+  planerin(s, p, a) {
+    if (a.type === "planerin") {
+      const idx = [...new Set((a.dice || []).map((x) => x | 0))].filter((i) => i >= 0 && i < s.dice.length).slice(0, 2);
+      if (!idx.length) throw new Error("Wähle Würfel");
+      useHero(s, p.seat, "planerin");
+      const faces = idx.map((i) => s.dice[i]);
+      s.dice = s.dice.filter((_, i) => !idx.includes(i));
+      s.taken[p.seat] = faces;
+      s.planerinTook[p.seat] = true;
+      log(s, `${seatName(s, p.seat)} nutzt die Planerin und nimmt ${faces.map((f) => D.TERRAIN_NAME[f]).join(" und ")}.`, p.seat);
+      erkl(s, p.seat, { k: "planerin", faces: faces.slice() });
+      for (const f of faces) harvest(s, p.seat, f, true, "planerin");
+    } else if (a.type !== "pass") throw new Error("Unbekannte Antwort");
+    p.step.i++;
+    finishPending(s, p.step);
+  },
+  hordeTie(s, p, a) {
+    if (!p.options.includes(a.pos)) throw new Error("Wähle eines der markierten Felder");
+    p.step.choice = a.pos;
+    finishPending(s, p.step);
+  },
+  raidOrder(s, p, a) {
+    // gleich nahe Überfälle (12.11.2026): Der Startspieler wählt, welches Feld zuerst überfallen wird
+    if (!p.options.includes(a.pos)) throw new Error("Wähle eines der markierten Felder");
+    p.step.choice = a.pos;
+    erkl(s, p.seat, () => ({ k: "ueberfallWahl", f: kindOf(s, a.pos), opts: p.options.map((f) => kindOf(s, f)), dist: board(s).dist[a.pos] }));
+    finishPending(s, p.step);
+  },
+  intervene(s, p, a) {
+    if (a.type === "hueterin" || a.type === "chronist") {
+      if (!p.can[a.type]) throw new Error("Nicht möglich");
+      heroHorde(s, p.seat, a.type, a.horde ?? p.hordes[0], p.kind);
+    } else if (a.type !== "pass") throw new Error("Unbekannte Antwort");
+    p.step.i++;
+    finishPending(s, p.step);
+  },
+  pay(s, p, a) {
+    const power = fightPower(s, p.seat, a);
+    if (s.variants.payOrder === "v03" && power > p.need) {
+      // nie mehr als nötig: keine Einheit darf übrig sein
+      const units = [];
+      if (a.erz | 0) units.push(1);
+      if (a.pferde | 0) units.push(horseValue(s, p.seat));
+      if (a.verstaerkung) units.push(3);
+      if (units.some((u) => power - u >= p.need)) throw new Error(`Höchstens ${p.need} Abwehr nötig`);
+    }
+    spendFight(s, p.seat, a);
+    p.step.paid[p.seat] = (p.step.paid[p.seat] || 0) + power;
+    // v0.5: Jeder gezahlte Rohstoff bringt Ruhm (die Verstärkung nicht), auch wenn die Abwehr am Ende nicht reicht
+    const ruhm = ((a.erz | 0) + (a.pferde | 0)) * (s.variants.payFame || 0);
+    if (ruhm) addFame(s, p.seat, ruhm, "horden");
+    if (power) log(s, `${seatName(s, p.seat)} zahlt ${power} Abwehr${ruhm ? ` (+${ruhm} Ruhm)` : ""}.`, p.seat);
+    erkl(s, p.seat, () => ({
+      k: "zahlung", art: p.kind, f: kindOf(s, p.field), erz: a.erz | 0, pferde: a.pferde | 0, verst: !!a.verstaerkung,
+      hv: horseValue(s, p.seat), wert: power, fehlte: p.need, ruhm, leiste: score(s, p.seat).leiste,
+    }));
+    p.step.i++;
+    finishPending(s, p.step);
+  },
+  treasure(s, p, a) {
+    if (!D.RES.includes(a.res)) throw new Error("Wähle einen Rohstoff");
+    const got = gain(s, p.seat, a.res, 1);
+    log(s, `${seatName(s, p.seat)} hebt den Schatz: 1 ${D.RES_NAME[a.res]}.`, p.seat);
+    erkl(s, p.seat, { k: "schatz", res: a.res, ist: got });
+    resume(s);
+  },
+  discard(s, p, a) {
+    const cards = a.cards || [];
+    if (cards.length !== p.n) throw new Error(`Lege ${p.n} Karte(n) ab`);
+    const hand = s.seats[p.seat].hand.slice();
+    for (const c of cards) {
+      const i = hand.indexOf(c);
+      if (i < 0) throw new Error("Diese Karte hast du nicht");
+      hand.splice(i, 1);
+    }
+    for (const c of cards) {
+      s.seats[p.seat].hand.splice(s.seats[p.seat].hand.indexOf(c), 1);
+      s.deck.push(c);
+    }
+    erkl(s, p.seat, { k: "ablegen", n: p.n, max: s.variants.handLimit });     // welche Karten, bleibt verdeckt
+    resume(s);
+  },
+  keepCards(s, p, a) {
+    const keep = a.keep || [];
+    if (keep.length !== Math.min(2, p.cards.length)) throw new Error("Behalte 2 Karten");
+    const rest = p.cards.slice();
+    for (const c of keep) {
+      const i = rest.indexOf(c);
+      if (i < 0) throw new Error("Ungültige Karte");
+      rest.splice(i, 1);
+    }
+    s.seats[p.seat].hand.push(...keep);
+    s.deck.push(...rest);
+    s.pending = s.stack.pop() || null;
+    checkHand(s, p.seat);
+    if (!s.pending) run(s);
+  },
+  tradeOffer(s, p, a) {
+    if (a.accept) {
+      if (!canAfford(s, p.seat, p.get)) throw new Error("Dafür fehlen dir Rohstoffe");
+      if (!canAfford(s, p.from, p.give)) throw new Error("Das Angebot ist nicht mehr gedeckt");
+      for (const [r, k] of Object.entries(p.give)) {
+        s.seats[p.from].res[r] -= k;
+        s.seats[p.seat].res[r] += k;
+      }
+      for (const [r, k] of Object.entries(p.get)) {
+        s.seats[p.seat].res[r] -= k;
+        s.seats[p.from].res[r] += k;
+      }
+      log(s, `${seatName(s, p.seat)} nimmt das Handelsangebot von ${seatName(s, p.from)} an.`, p.seat);
+    } else log(s, `${seatName(s, p.seat)} lehnt das Angebot von ${seatName(s, p.from)} ab.`, p.seat);
+    erkl(s, p.seat, { k: "handel", von: p.from, gib: { ...p.give }, nimm: { ...p.get }, ja: !!a.accept });
+    resume(s);
+  },
+};
+
+/** Aktion eines Platzes ausführen. -> wirft Error mit deutscher Meldung, wenn sie nicht erlaubt ist. */
+export function act(s, seat, a) {
+  if (s.over) throw new Error("Das Spiel ist vorbei");
+  const p = s.pending;
+  if (!p) throw new Error("Gerade ist nichts zu entscheiden");
+  if (p.seat !== seat) throw new Error(`${seatName(s, p.seat)} ist dran`);
+  if (p.type === "raidOrder" && !s.variants.raidTieChoice) {   // nur alte Spielstände (bis 7.11.2026): Reihenfolge automatisch
+    p.step.choice = p.options[0];
+    finishPending(s, p.step);
+    s.rev++;
+    return s;
+  }
+  if (p.type === "turn") {
+    const fn = TURN_ACTIONS[a.type];
+    if (!fn) throw new Error("Unbekannte Aktion");
+    if (!p.dieTaken && !["takeDie", "takeResource"].includes(a.type) && !(a.type === "hero" && a.hero === "planerin")) {
+      throw new Error("Nimm zuerst einen Würfel (oder einen Rohstoff)");
+    }
+    if (p.trost > 0 && a.type !== "takeResource") throw new Error("Dein Würfel bringt nichts: Nimm zuerst 1 beliebigen Rohstoff");
+    fn(s, seat, a, p);
+  } else {
+    const fn = DECISIONS[p.type];
+    if (!fn) throw new Error("Unbekannte Entscheidung");
+    fn(s, p, a);
+  }
+  s.rev++;
+  return s;
+}
+
+// ------------------------------------------------------------------ Sicht eines Spielers (versteckte Infos entfernt)
+// Verdeckt: Schicksalskarten auf der Hand und die zwei gezogenen Helden, solange einer gewählt wird. Die Helden selbst
+// liegen offen vor ihrem Besitzer (REGELN.md, Aufbau 7), wie am Tisch.
+export function view(s, seats = []) {
+  const mine = new Set(seats);
+  const v = JSON.parse(JSON.stringify(s));
+  delete v.rng;
+  delete v.queue;
+  // Der Startwert verrät verdeckte Karten, Nebel-Plättchen und die nächsten Würfe: erst nach dem Spielende zeigen
+  // (alte Spielstände nennen ihn noch in der ersten Verlaufszeile)
+  if (!s.over) {
+    delete v.seed;
+    for (const l of v.log) if (l.msg && l.msg.startsWith("Neues Spiel mit ")) l.msg = l.msg.replace(/ \(Startwert -?\d+\)/, "");
+  }
+  v.bag = s.bag.length;
+  v.deck = s.deck.length;
+  v.stack = s.stack.length;
+  v.seats.forEach((x, i) => {
+    delete v.seats[i].wantHero;
+    if (!mine.has(i) && !s.over) {
+      v.seats[i].hand = x.hand.length;
+      v.seats[i].heroOffer = x.heroOffer ? x.heroOffer.length : null;
+    }
+  });
+  if (v.pending && !mine.has(v.pending.seat)) {
+    delete v.pending.cards;
+    delete v.pending.offer;
+  }
+  if (v.pending) delete v.pending.step;
+  return v;
+}
